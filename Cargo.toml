@@ -1,0 +1,27 @@
+[package]
+name = "scribecut"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
+chrono = "0.4.45"
+dirs = "7.0.0"
+eframe = "0.36.2"
+egui = "0.36.2"
+gst = { package = "gstreamer", version = "0.25.4" }
+gst-app = { package = "gstreamer-app", version = "0.25.2" }
+gst-video = { package = "gstreamer-video", version = "0.25.4" }
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt", "sync"] }
+ureq = "3.4.2"
+whisper-rs = "0.16.0"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
