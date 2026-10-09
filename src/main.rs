@@ -5,6 +5,7 @@ mod export;
 mod media;
 mod player;
 mod project;
+mod sway;
 mod transcribe;
 
 fn main() -> eframe::Result {

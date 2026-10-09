@@ -9,53 +9,85 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ashpd::desktop::PersistMode;
+use ashpd::enumflags2::BitFlags;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use gst::prelude::*;
+
+use crate::sway;
+
+/// One runtime for all portal calls. ashpd caches its D-Bus connection
+/// globally, and that connection's background tasks live on the runtime that
+/// created it: with a fresh runtime per call, later calls hang forever.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("portal")
+            .enable_all()
+            .build()
+            .expect("failed to start the portal runtime")
+    });
+    &RUNTIME
+}
 
 /// An open ScreenCast portal session. Dropping it closes the session.
 pub struct Portal {
     node_id: u32,
     fd: OwnedFd,
+    /// Where the shared monitor sits in the compositor layout, if reported.
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
     close: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+struct Opened {
+    node_id: u32,
+    fd: OwnedFd,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    restore_token: Option<String>,
+}
+
 impl Portal {
-    /// Shows the portal's source picker. Blocks until the user chooses (call off the UI thread).
-    pub fn open() -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<Result<(u32, OwnedFd)>>();
+    /// Asks the portal for a monitor or a window. Blocks until the user chooses
+    /// (call off the UI thread). With a `restore_token` from an earlier session
+    /// the portal may skip its picker; the returned session's new token is saved.
+    fn open(source: SourceType, restore_token: Option<String>) -> Result<(Self, Option<String>)> {
+        let (tx, rx) = mpsc::channel::<Result<Opened>>();
         let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => return drop(tx.send(Err(e.into()))),
-            };
-            rt.block_on(async move {
+            runtime().block_on(async move {
                 let result: Result<_> = async {
                     let proxy = Screencast::new().await?;
                     let session = proxy.create_session(Default::default()).await?;
-                    // wlroots' portal only offers monitors; ask for windows only where supported.
-                    let wanted = SourceType::Monitor | SourceType::Window;
-                    let available = proxy.available_source_types().await.unwrap_or(SourceType::Monitor.into());
-                    let sources = if (available & wanted).is_empty() { SourceType::Monitor.into() } else { available & wanted };
+                    let persist = if source == SourceType::Monitor { PersistMode::ExplicitlyRevoked } else { PersistMode::DoNot };
                     proxy
                         .select_sources(
                             &session,
                             SelectSourcesOptions::default()
                                 .set_cursor_mode(CursorMode::Embedded)
-                                .set_sources(sources)
+                                .set_sources(BitFlags::from(source))
                                 .set_multiple(false)
-                                .set_persist_mode(PersistMode::DoNot),
+                                .set_persist_mode(persist)
+                                .set_restore_token(restore_token.as_deref()),
                         )
                         .await?;
                     let streams = proxy.start(&session, None, Default::default()).await?.response()?;
-                    let stream = streams.streams().first().context("no screen selected")?.to_owned();
+                    let stream = streams.streams().first().context("nothing selected")?.to_owned();
                     let fd = proxy.open_pipe_wire_remote(&session, Default::default()).await?;
-                    Ok((proxy, session, stream.pipe_wire_node_id(), fd))
+                    let opened = Opened {
+                        node_id: stream.pipe_wire_node_id(),
+                        fd,
+                        position: stream.position(),
+                        size: stream.size(),
+                        restore_token: streams.restore_token().map(str::to_owned),
+                    };
+                    Ok((proxy, session, opened))
                 }
                 .await;
                 match result {
-                    Ok((_proxy, session, node, fd)) => {
-                        if tx.send(Ok((node, fd))).is_ok() {
+                    Ok((_proxy, session, opened)) => {
+                        if tx.send(Ok(opened)).is_ok() {
                             let _ = close_rx.await;
                         }
                         let _ = session.close().await;
@@ -66,8 +98,70 @@ impl Portal {
                 }
             });
         });
-        let (node_id, fd) = rx.recv().map_err(|_| anyhow!("portal thread died"))??;
-        Ok(Self { node_id, fd, close: Some(close_tx) })
+        let o = rx.recv().map_err(|_| anyhow!("portal thread died"))??;
+        let portal = Self { node_id: o.node_id, fd: o.fd, position: o.position, size: o.size, close: Some(close_tx) };
+        Ok((portal, o.restore_token))
+    }
+
+    /// Whether this monitor stream shows `output`.
+    fn shows(&self, output: &sway::Output) -> bool {
+        let a = output.area;
+        match (self.position, self.size) {
+            (Some(p), _) => p == (a.x, a.y),
+            (None, Some(s)) => s == (a.w, a.h),
+            (None, None) => true,
+        }
+    }
+}
+
+/// What to record.
+pub enum Source {
+    /// A whole monitor, chosen in the portal's picker.
+    Monitor,
+    /// A single window, chosen in the portal's picker (desktops that support it).
+    PortalWindow,
+    /// A rectangle of the screen (a region, or a window's area on sway),
+    /// recorded by cropping the monitor it is on.
+    Area(sway::Area),
+}
+
+/// Whether the portal can share individual windows (not on sway 1.11).
+pub fn portal_supports_windows() -> bool {
+    runtime().block_on(async {
+        let Ok(proxy) = Screencast::new().await else { return false };
+        proxy.available_source_types().await.is_ok_and(|t| t.contains(SourceType::Window))
+    })
+}
+
+/// Opens the screen stream for `source`. Blocks on the portal dialog.
+pub fn connect(source: Source) -> Result<(Portal, Option<sway::Crop>)> {
+    match source {
+        Source::Monitor => Ok((Portal::open(SourceType::Monitor, None)?.0, None)),
+        Source::PortalWindow => Ok((Portal::open(SourceType::Window, None)?.0, None)),
+        Source::Area(area) => {
+            let outputs = sway::outputs()?;
+            let output = sway::output_for(&area, &outputs).context("that area is not on any monitor")?;
+            // Reuse the last monitor choice so the user isn't asked again; ask
+            // if it was a different monitor than the one the area is on.
+            let token_file = dirs::data_dir().map(|d| d.join("scribecut/portal_token"));
+            let saved = token_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
+            let mut attempt = Portal::open(SourceType::Monitor, saved)?;
+            if !attempt.0.shows(&output) {
+                drop(attempt);
+                attempt = Portal::open(SourceType::Monitor, None)?;
+                if !attempt.0.shows(&output) {
+                    bail!("please pick monitor {} in the dialog - the area is on it", output.name);
+                }
+            }
+            let (portal, token) = attempt;
+            if let (Some(file), Some(token)) = (token_file, token) {
+                let _ = std::fs::create_dir_all(file.parent().unwrap());
+                let _ = std::fs::write(file, token);
+            }
+            let crop = sway::crop_for(&area, &output);
+            let none = sway::Crop { left: 0, top: 0, right: 0, bottom: 0 };
+            Ok((portal, (crop != none).then_some(crop)))
+        }
     }
 }
 
@@ -100,12 +194,15 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn new(portal: Portal, dir: PathBuf) -> Result<Self> {
+    pub fn new(portal: Portal, crop: Option<sway::Crop>, dir: PathBuf) -> Result<Self> {
         // pipewiresrc's own timestamps don't line up with the pipeline clock, so
         // run it unsynchronised and let each segment's appsrc stamp frames on arrival.
         let fd = portal.fd.try_clone()?.into_raw_fd();
+        let crop = crop
+            .map(|c| format!("! videocrop left={} top={} right={} bottom={} ", c.left, c.top, c.right, c.bottom))
+            .unwrap_or_default();
         let screen = gst::parse::launch(&format!(
-            "pipewiresrc fd={fd} path={} ! videoconvert ! video/x-raw,format=I420 \
+            "pipewiresrc fd={fd} path={} {crop}! videoconvert ! video/x-raw,format=I420 \
              ! appsink name=frames sync=false max-buffers=4 drop=true",
             portal.node_id
         ))?

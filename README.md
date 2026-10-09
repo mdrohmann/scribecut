@@ -17,7 +17,18 @@ for a smaller, faster one (or e.g. `small` for non-English).
 
 ## Recording
 
-Record → pick a screen → Pause / Resume as often as you like → Stop & edit. Each piece is saved to
+Pick what to record:
+
+- **Full screen** – choose a monitor in the system's sharing dialog.
+- **Window** – choose from a list of open windows (browsers first, filterable by title), or click one
+  on screen. On sway, whose portal (as of 1.11) can only share whole monitors, scribecut records the
+  monitor cropped to the window: keep it in place and uncovered while recording. Windows on another
+  workspace are brought to the front first. On desktops whose portal shares windows, its own picker is used.
+- **Region** – drag out a rectangle (sway, needs `slurp`).
+
+For window and region recordings the monitor choice is remembered, so the dialog usually only appears once.
+
+Then Pause / Resume as often as you like → Stop & edit. Each piece is saved to
 `~/Videos/scribecut/<timestamp>/`, joined into `recording.mkv`, and transcribed in the background.
 Resume points show as yellow lines on the timeline.
 
