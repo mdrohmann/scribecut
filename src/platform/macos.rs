@@ -136,6 +136,29 @@ pub fn focus_window(id: i64, pid: i32) -> Result<Area> {
         .context("that window is no longer on screen")
 }
 
+/// Whether a window is still on screen; `None` if it no longer exists.
+///
+/// `kCGWindowListOptionOnScreenOnly` only reports windows on the current Space,
+/// so "listed" and "visible" are the same question here. A window that has been
+/// closed is gone from the list entirely, which is the `None` case; one that is
+/// merely on another Space or minimised reads as not visible.
+pub fn window_visible(id: i64) -> Result<Option<bool>> {
+    if windows()?.iter().any(|w| w.id == id) {
+        return Ok(Some(true));
+    }
+    // Ask again including off-screen windows, to tell "hidden" from "closed".
+    let all = copy_window_info(kCGWindowListExcludeDesktopElements, kCGNullWindowID)
+        .context("CGWindowListCopyWindowInfo returned nothing")?;
+    for item in all.iter() {
+        // Each element of the window list is a window description dictionary.
+        let dict: Dict = unsafe { CFDictionary::wrap_under_get_rule(*item as _) };
+        if number(&dict, unsafe { kCGWindowNumber }).unwrap_or(-1.0) as i64 == id {
+            return Ok(Some(false));
+        }
+    }
+    Ok(None)
+}
+
 /// All active displays, with both their logical layout size and their real
 /// pixel size, so Retina scaling can be worked out.
 pub fn outputs() -> Result<Vec<Output>> {

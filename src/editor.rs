@@ -1,14 +1,16 @@
 //! The editing screen: video preview, word-linked transcript, timeline with
 //! cuts, and text overlays.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::player::{Player, preview_size};
-use crate::project::{Overlay, Project, Range, Word};
+use crate::project::{CameraMode, Corner, Overlay, Project, Range, Slide, Word};
 use crate::transcribe;
 
 pub const OVERLAY_FONT: &str = "overlay";
@@ -20,6 +22,9 @@ const SELECTED_WORD: Color32 = Color32::from_rgb(35, 70, 125);
 const SEGMENT: Color32 = Color32::from_rgb(230, 180, 40);
 const OVERLAY_BAR: Color32 = Color32::from_rgb(60, 140, 90);
 const WAVE: Color32 = Color32::from_rgb(70, 170, 200);
+const SLIDE_BAR: Color32 = Color32::from_rgb(120, 80, 170);
+const CAMERA_FULL: Color32 = Color32::from_rgb(220, 120, 40);
+const CAMERA_PIP: Color32 = Color32::from_rgb(170, 110, 60);
 
 /// A background task reporting progress and a final result.
 struct Job<T> {
@@ -74,6 +79,38 @@ impl<T: Send + 'static> Job<T> {
     }
 }
 
+/// Identifies a slide picture: resolved file, page and clip position.
+type SlideKey = (PathBuf, u32, u64);
+
+enum SlideImage {
+    Loading(Job<egui::ColorImage>),
+    Ready(egui::TextureHandle),
+    Failed(String),
+}
+
+/// A slide being created or edited in the dialog.
+struct SlideDraft {
+    index: Option<usize>,
+    slide: Slide,
+}
+
+/// Loads an image file for display, at most 1600 pixels wide.
+fn load_image(path: &Path) -> Result<egui::ColorImage> {
+    let img = image::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let img = if img.width() > 1600 { img.resize(1600, 1600 * img.height() / img.width(), image::imageops::FilterType::Triangle) } else { img };
+    let rgba = img.to_rgba8();
+    Ok(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
+}
+
+/// The largest rect with `aspect` (w/h) centred in `outer`.
+fn fit_rect(outer: Rect, aspect: f32) -> Rect {
+    let mut size = vec2(outer.width(), outer.width() / aspect);
+    if size.y > outer.height() {
+        size = vec2(outer.height() * aspect, outer.height());
+    }
+    Rect::from_center_size(outer.center(), size)
+}
+
 /// An overlay being created or edited in the dialog.
 struct Draft {
     index: Option<usize>,
@@ -96,7 +133,17 @@ pub struct Editor {
     drag_from: Option<f64>,
     draft: Option<Draft>,
     placing: bool,
-    undo: Vec<(Vec<Range>, Vec<Overlay>)>,
+    slide_draft: Option<SlideDraft>,
+    /// Earlier states of the edits (words excluded) for undo.
+    undo: Vec<Project>,
+    /// Camera track player, kept in step with `player`.
+    camera: Option<Player>,
+    camera_texture: Option<egui::TextureHandle>,
+    /// Slide pictures for the preview, by slide file/page.
+    slide_images: HashMap<SlideKey, SlideImage>,
+    /// Modification time of the edit file as we last wrote or read it.
+    edit_mtime: Option<SystemTime>,
+    last_reload_check: Instant,
     transcription: Option<Job<Vec<Word>>>,
     /// Loudness envelope (see `media::audio_peaks`), empty until loaded.
     waveform: Vec<f32>,
@@ -109,14 +156,13 @@ pub struct Editor {
 }
 
 impl Editor {
-    /// Opens a video file or a `.scribecut.json` project.
+    /// Opens a video file (with its edit file, if any) or an edit file.
     pub fn open(path: &Path, ctx: &egui::Context) -> Result<Self> {
-        let project = if path.extension().is_some_and(|e| e == "json") {
-            Project::load(path)?
-        } else if Project::path_for(path).is_file() {
-            Project::load(&Project::path_for(path))?
-        } else {
+        let is_video = !path.extension().is_some_and(|e| e == "toml" || e == "json");
+        let project = if is_video && !Project::path_for(path).is_file() && !path.with_extension("scribecut.json").is_file() {
             new_project(path, Vec::new())?
+        } else {
+            Project::load(path)?
         };
         Self::new(project, ctx)
     }
@@ -126,6 +172,10 @@ impl Editor {
         let player = Player::new(&project.media, preview, ctx.clone())
             .with_context(|| format!("opening {}", project.media.display()))?;
         let duration = project.duration.max(0.1);
+        let camera = match project.camera_size {
+            Some((w, h)) => Player::silent_stream(&project.media, 1, preview_size(w, h, 640), ctx.clone()).ok(),
+            None => None,
+        };
         let mut editor = Self {
             project,
             player,
@@ -137,7 +187,13 @@ impl Editor {
             drag_from: None,
             draft: None,
             placing: false,
+            slide_draft: None,
             undo: Vec::new(),
+            camera,
+            camera_texture: None,
+            slide_images: HashMap::new(),
+            edit_mtime: None,
+            last_reload_check: Instant::now(),
             transcription: None,
             waveform: Vec::new(),
             waveform_floor_db: -50.0,
@@ -153,7 +209,7 @@ impl Editor {
                 editor.start_transcription(ctx);
             }
         }
-        let _ = editor.project.save();
+        editor.save();
         Ok(editor)
     }
 
@@ -167,24 +223,61 @@ impl Editor {
         }));
     }
 
+    fn edit_path(&self) -> PathBuf {
+        Project::path_for(&self.project.media)
+    }
+
     fn save(&mut self) {
-        if let Err(e) = self.project.save() {
-            self.message = Some(format!("Saving failed: {e:#}"));
+        match self.project.save() {
+            Ok(()) => self.edit_mtime = std::fs::metadata(self.edit_path()).and_then(|m| m.modified()).ok(),
+            Err(e) => self.message = Some(format!("Saving failed: {e:#}")),
         }
+    }
+
+    /// Picks up changes to the edit file made outside the app (by hand or an agent).
+    fn reload_if_changed(&mut self) {
+        if self.last_reload_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_reload_check = Instant::now();
+        let path = self.edit_path();
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else { return };
+        if Some(mtime) == self.edit_mtime {
+            return;
+        }
+        self.edit_mtime = Some(mtime);
+        match Project::load(&path) {
+            Ok(mut fresh) => {
+                fresh.words = std::mem::take(&mut self.project.words);
+                self.undo.push(self.snapshot());
+                self.project = fresh;
+                self.draft = None;
+                self.slide_draft = None;
+                self.placing = false;
+                self.message = Some(format!("{} changed - reloaded", path.file_name().unwrap_or_default().to_string_lossy()));
+            }
+            Err(e) => self.message = Some(format!("Not reloaded, {e:#}")),
+        }
+    }
+
+    /// The edits without the (large, unchanging) word list.
+    fn snapshot(&self) -> Project {
+        Project { words: Vec::new(), ..self.project.clone() }
     }
 
     /// Records the current edits so they can be undone, then applies `f`.
     fn edit(&mut self, f: impl FnOnce(&mut Project)) {
-        self.undo.push((self.project.cuts.clone(), self.project.overlays.clone()));
+        self.undo.push(self.snapshot());
         f(&mut self.project);
         self.save();
     }
 
     fn undo(&mut self) {
-        if let Some((cuts, overlays)) = self.undo.pop() {
-            self.project.cuts = cuts;
-            self.project.overlays = overlays;
+        if let Some(mut previous) = self.undo.pop() {
+            previous.words = std::mem::take(&mut self.project.words);
+            self.project = previous;
             self.draft = None;
+            self.slide_draft = None;
             self.placing = false;
             self.save();
         }
@@ -193,6 +286,9 @@ impl Editor {
     fn seek(&mut self, t: f64) {
         let t = t.clamp(0.0, self.project.duration);
         self.player.seek(t);
+        if let Some(cam) = &mut self.camera {
+            cam.seek(t);
+        }
         self.pos = t;
     }
 
@@ -221,6 +317,22 @@ impl Editor {
         self.placing = false;
     }
 
+    fn export_script(&mut self) {
+        let media = &self.project.media;
+        let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+        let mut dialog = rfd::FileDialog::new()
+            .set_file_name(format!("{stem}_script.md"))
+            .add_filter("Markdown", &["md"]);
+        if let Some(dir) = media.parent() {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(out) = dialog.save_file() else { return };
+        self.message = Some(match std::fs::write(&out, crate::script::script(&self.project)) {
+            Ok(()) => format!("Script saved to {}", out.display()),
+            Err(e) => format!("Saving script failed: {e}"),
+        });
+    }
+
     fn start_export(&mut self, ctx: &egui::Context) {
         let media = &self.project.media;
         let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
@@ -240,17 +352,23 @@ impl Editor {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let ctx = ui.ctx().clone();
+        self.reload_if_changed();
         self.poll_jobs();
         if let Some(err) = self.player.poll() {
             self.message = Some(format!("Playback error: {err}"));
         }
         self.pos = self.player.position();
         self.skip_cuts();
+        self.sync_camera();
         if self.player.playing {
             self.follow_playhead();
             ctx.request_repaint();
+        } else {
+            // Keep checking the edit file for outside changes.
+            ctx.request_repaint_after(Duration::from_secs(1));
         }
         self.upload_frame(&ctx);
+        self.upload_camera_frame(&ctx);
         self.keyboard(&ctx);
 
         let mut action = None;
@@ -267,7 +385,46 @@ impl Editor {
         egui::Panel::right("side").resizable(true).default_size(400.0).show(ui, |ui| self.side_panel(ui, &ctx));
         egui::CentralPanel::default().show(ui, |ui| self.video(ui));
         self.overlay_dialog(&ctx);
+        self.slide_dialog(&ctx);
         action
+    }
+
+    /// Keeps the camera player playing in step with the main one.
+    fn sync_camera(&mut self) {
+        let Some(cam) = &mut self.camera else { return };
+        let _ = cam.poll();
+        if cam.playing != self.player.playing {
+            if self.player.playing { cam.play() } else { cam.pause() }
+        }
+        if self.player.playing && (cam.position() - self.pos).abs() > 0.15 {
+            cam.seek(self.pos);
+        }
+    }
+
+    /// The preview picture for slide `i`, loading it in the background on first use.
+    fn slide_texture(&mut self, i: usize, ctx: &egui::Context) -> Result<Option<egui::TextureHandle>, String> {
+        let slide = self.project.slides[i].clone();
+        let key: SlideKey = (self.project.resolve(&slide.file), slide.page, slide.clip_start.to_bits());
+        if let Some(SlideImage::Loading(job)) = self.slide_images.get_mut(&key)
+            && let Some(result) = job.poll()
+        {
+            let state = match result {
+                Ok(img) => SlideImage::Ready(ctx.load_texture("slide", img, egui::TextureOptions::LINEAR)),
+                Err(e) => SlideImage::Failed(format!("{e:#}")),
+            };
+            self.slide_images.insert(key.clone(), state);
+        }
+        match self.slide_images.get(&key) {
+            Some(SlideImage::Ready(tex)) => Ok(Some(tex.clone())),
+            Some(SlideImage::Failed(e)) => Err(e.clone()),
+            Some(SlideImage::Loading(_)) => Ok(None),
+            None => {
+                let project = self.snapshot();
+                let job = Job::spawn(ctx, "Slide", move |_| load_image(&crate::sources::still(&project, &slide, 720)?));
+                self.slide_images.insert(key, SlideImage::Loading(job));
+                Ok(None)
+            }
+        }
     }
 
     fn poll_jobs(&mut self) {
@@ -290,7 +447,9 @@ impl Editor {
             match result {
                 Ok(words) => {
                     self.project.words = words;
-                    self.save();
+                    if let Err(e) = self.project.save_transcript() {
+                        self.message = Some(format!("Saving the transcript failed: {e:#}"));
+                    }
                 }
                 Err(e) => self.message = Some(format!("Transcription failed: {e:#}")),
             }
@@ -334,6 +493,16 @@ impl Editor {
         match &mut self.texture {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),
             None => self.texture = Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR)),
+        }
+    }
+
+    fn upload_camera_frame(&mut self, ctx: &egui::Context) {
+        let Some(cam) = &self.camera else { return };
+        let Some(frame) = cam.frame.lock().unwrap().take() else { return };
+        let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+        match &mut self.camera_texture {
+            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+            None => self.camera_texture = Some(ctx.load_texture("camera", image, egui::TextureOptions::LINEAR)),
         }
     }
 
@@ -428,6 +597,39 @@ impl Editor {
         if ui.button("+ Add overlay").on_hover_text("Text over the selected time range").clicked() {
             self.new_overlay_draft();
         }
+        if ui.button("+ Slide…").on_hover_text("Show an image, PDF/presentation page or video clip instead of the screen for the selected time range").clicked() {
+            self.add_slide();
+        }
+        let has_camera = self.project.camera_size.is_some();
+        ui.add_enabled_ui(has_camera, |ui| {
+            ui.menu_button("Camera", |ui| {
+                ui.label("For the selection:");
+                for mode in CameraMode::ALL {
+                    if ui.add_enabled(self.selection.is_some(), egui::Button::new(mode.label())).clicked()
+                        && let Some(sel) = self.selection
+                    {
+                        self.edit(|p| p.set_camera(sel, mode));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.label("Everywhere else:");
+                for mode in CameraMode::ALL {
+                    if ui.radio(self.project.camera.default == mode, mode.label()).clicked() {
+                        self.edit(|p| p.camera.default = mode);
+                    }
+                }
+                ui.separator();
+                ui.label("Small window corner:");
+                for corner in Corner::ALL {
+                    if ui.radio(self.project.camera.corner == corner, corner.name()).clicked() {
+                        self.edit(|p| p.camera.corner = corner);
+                    }
+                }
+            })
+        })
+        .response
+        .on_disabled_hover_text("This recording has no camera track");
         if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
             self.undo();
         }
@@ -437,6 +639,13 @@ impl Editor {
             None => {
                 if ui.button("Export…").clicked() {
                     self.start_export(ctx);
+                }
+                if ui
+                    .add_enabled(!self.project.words.is_empty(), egui::Button::new("Export script…"))
+                    .on_hover_text("The transcript after cuts, as Markdown, to re-record from")
+                    .clicked()
+                {
+                    self.export_script();
                 }
             }
         }
@@ -473,8 +682,45 @@ impl Editor {
         let response = ui.allocate_rect(rect, Sense::click());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         if let Some(tex) = &self.texture {
-            painter.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            painter.image(tex.id(), rect, uv, Color32::WHITE);
+        }
+
+        // Same layering as the export: screen < slide < camera < text.
+        if let Some(i) = self.project.slide_at(self.pos) {
+            painter.rect_filled(rect, 0.0, Color32::BLACK);
+            match self.slide_texture(i, ui.ctx()) {
+                Ok(Some(tex)) => {
+                    let [w, h] = tex.size();
+                    painter.image(tex.id(), fit_rect(rect, w as f32 / h.max(1) as f32), uv, Color32::WHITE);
+                }
+                Ok(None) => {
+                    painter.text(rect.center(), Align2::CENTER_CENTER, "loading slide…", FontId::proportional(16.0), Color32::GRAY);
+                }
+                Err(e) => {
+                    painter.text(rect.center(), Align2::CENTER_CENTER, format!("slide {}: {e}", i + 1), FontId::proportional(14.0), Color32::from_rgb(230, 90, 90));
+                }
+            }
+        }
+        if let (Some(tex), Some((cw, ch))) = (&self.camera_texture, self.project.camera_size) {
+            let aspect = cw as f32 / ch.max(1) as f32;
+            match self.project.camera_mode_at(self.pos) {
+                CameraMode::Full => {
+                    painter.rect_filled(rect, 0.0, Color32::BLACK);
+                    painter.image(tex.id(), fit_rect(rect, aspect), uv, Color32::WHITE);
+                }
+                CameraMode::Pip => {
+                    let c = self.project.camera;
+                    let w = rect.width() * c.width;
+                    let m = rect.width() * c.margin;
+                    let size = vec2(w, w / aspect);
+                    let x = if matches!(c.corner, Corner::TopLeft | Corner::BottomLeft) { rect.left() + m } else { rect.right() - m - size.x };
+                    let y = if matches!(c.corner, Corner::TopLeft | Corner::TopRight) { rect.top() + m } else { rect.bottom() - m - size.y };
+                    painter.image(tex.id(), Rect::from_min_size(pos2(x, y), size), uv, Color32::WHITE);
+                }
+                CameraMode::Off => {}
+            }
         }
 
         let editing = self.draft.as_ref().and_then(|d| d.index);
@@ -620,6 +866,114 @@ impl Editor {
         }
     }
 
+    /// Picks a file and opens the slide dialog for the selection (or 5 s from the playhead).
+    fn add_slide(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("Image, PDF, presentation or video", crate::sources::EXTENSIONS);
+        dialog = dialog.set_directory(self.project.base_dir());
+        let Some(file) = dialog.pick_file() else { return };
+        let base = self.project.base_dir();
+        let file = file.strip_prefix(&base).map(Path::to_path_buf).unwrap_or(file);
+        let range = self
+            .selection
+            .unwrap_or_else(|| Range::new(self.pos, (self.pos + 5.0).min(self.project.duration)));
+        self.slide_draft = Some(SlideDraft {
+            index: None,
+            slide: Slide { start: range.start, end: range.end, file, page: 1, clip_start: 0.0 },
+        });
+    }
+
+    fn edit_slide(&mut self, i: usize) {
+        self.slide_draft = Some(SlideDraft { index: Some(i), slide: self.project.slides[i].clone() });
+    }
+
+    fn slide_dialog(&mut self, ctx: &egui::Context) {
+        let Some(draft) = &mut self.slide_draft else { return };
+        let (duration, selection, pos) = (self.project.duration, self.selection, self.pos);
+        let kind = crate::sources::kind(&draft.slide.file);
+        let (mut open, mut save, mut delete, mut change_file) = (true, false, false, false);
+        let title = if draft.index.is_some() { "Edit slide" } else { "Add slide" };
+        egui::Window::new(title).open(&mut open).resizable(false).show(ctx, |ui| {
+            let s = &mut draft.slide;
+            egui::Grid::new("slide_grid").num_columns(2).show(ui, |ui| {
+                ui.label("File");
+                ui.horizontal(|ui| {
+                    ui.monospace(s.file.display().to_string());
+                    if ui.small_button("Change…").clicked() {
+                        change_file = true;
+                    }
+                });
+                ui.end_row();
+                ui.label("From");
+                ui.add(egui::DragValue::new(&mut s.start).speed(0.05).range(0.0..=duration).custom_formatter(|v, _| fmt_time(v)));
+                ui.end_row();
+                ui.label("To");
+                ui.add(egui::DragValue::new(&mut s.end).speed(0.05).range(0.0..=duration).custom_formatter(|v, _| fmt_time(v)));
+                ui.end_row();
+                ui.label("");
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(selection.is_some(), egui::Button::new("Use selection")).clicked()
+                        && let Some(sel) = selection
+                    {
+                        (s.start, s.end) = (sel.start, sel.end);
+                    }
+                    if ui.button("Playhead +5s").clicked() {
+                        (s.start, s.end) = (pos, (pos + 5.0).min(duration));
+                    }
+                });
+                ui.end_row();
+                match kind {
+                    Some(crate::sources::Kind::Pdf | crate::sources::Kind::Presentation) => {
+                        ui.label("Page");
+                        ui.add(egui::DragValue::new(&mut s.page).range(1..=9999));
+                        ui.end_row();
+                    }
+                    Some(crate::sources::Kind::Video) => {
+                        ui.label("Start clip at");
+                        ui.add(egui::DragValue::new(&mut s.clip_start).speed(0.05).range(0.0..=f64::MAX).custom_formatter(|v, _| fmt_time(v)));
+                        ui.end_row();
+                    }
+                    _ => {}
+                }
+            });
+            if s.end < s.start {
+                std::mem::swap(&mut s.start, &mut s.end);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(if draft.index.is_some() { "Save" } else { "Add" }).clicked() {
+                    save = true;
+                }
+                if draft.index.is_some() && ui.button("Delete").clicked() {
+                    delete = true;
+                }
+            });
+        });
+        if change_file
+            && let Some(file) = rfd::FileDialog::new()
+                .add_filter("Image, PDF, presentation or video", crate::sources::EXTENSIONS)
+                .set_directory(self.project.base_dir())
+                .pick_file()
+        {
+            let base = self.project.base_dir();
+            draft.slide.file = file.strip_prefix(&base).map(Path::to_path_buf).unwrap_or(file);
+        }
+        if save {
+            let draft = self.slide_draft.take().unwrap();
+            self.edit(|p| match draft.index {
+                Some(i) if i < p.slides.len() => p.slides[i] = draft.slide,
+                _ => p.slides.push(draft.slide),
+            });
+        } else if delete {
+            if let Some(i) = self.slide_draft.take().and_then(|d| d.index) {
+                self.edit(|p| {
+                    p.slides.remove(i);
+                });
+            }
+        } else if !open {
+            self.slide_draft = None;
+        }
+    }
+
     fn edit_overlay(&mut self, i: usize) {
         self.draft = Some(Draft { index: Some(i), overlay: self.project.overlays[i].clone() });
         self.placing = false;
@@ -631,7 +985,7 @@ impl Editor {
 
     fn timeline(&mut self, ui: &mut egui::Ui) {
         let width = ui.available_width();
-        let (rect, response) = ui.allocate_exact_size(vec2(width, 150.0), Sense::click_and_drag());
+        let (rect, response) = ui.allocate_exact_size(vec2(width, 184.0), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         let duration = self.project.duration.max(0.1);
 
@@ -654,11 +1008,14 @@ impl Editor {
         let ruler = Rect::from_min_size(rect.min, vec2(width, 18.0));
         let track = Rect::from_min_size(pos2(rect.left(), ruler.bottom() + 2.0), vec2(width, 44.0));
         let wave = Rect::from_min_size(pos2(rect.left(), track.bottom() + 2.0), vec2(width, 56.0));
-        let lane = Rect::from_min_size(pos2(rect.left(), wave.bottom() + 4.0), vec2(width, 22.0));
+        let visual = Rect::from_min_size(pos2(rect.left(), wave.bottom() + 4.0), vec2(width, 22.0));
+        let cam = Rect::from_min_size(pos2(rect.left(), visual.bottom() + 2.0), vec2(width, 8.0));
+        let lane = Rect::from_min_size(pos2(rect.left(), cam.bottom() + 2.0), vec2(width, 22.0));
         let visuals = ui.visuals();
         painter.rect_filled(track, 3.0, visuals.extreme_bg_color);
         painter.rect_filled(wave, 3.0, visuals.extreme_bg_color);
         painter.rect_filled(lane, 3.0, visuals.faint_bg_color);
+        painter.rect_filled(visual, 3.0, visuals.faint_bg_color);
 
         // Ruler ticks.
         let (start, len) = self.view;
@@ -703,6 +1060,27 @@ impl Editor {
             let x = self.t_to_x(rect, b);
             painter.line_segment([pos2(x, edit_area.top()), pos2(x, edit_area.bottom())], Stroke::new(2.0, SEGMENT));
         }
+        for s in &self.project.slides {
+            let r = self.span(visual, s.start, s.end).shrink2(vec2(0.0, 2.0));
+            painter.rect_filled(r, 3.0, SLIDE_BAR);
+            let name = s.file.file_name().unwrap_or_default().to_string_lossy();
+            let label = match crate::sources::kind(&s.file) {
+                Some(crate::sources::Kind::Pdf | crate::sources::Kind::Presentation) => format!("{name} p{}", s.page),
+                _ => name.to_string(),
+            };
+            painter.with_clip_rect(r).text(r.left_center() + vec2(4.0, 0.0), Align2::LEFT_CENTER, label, FontId::proportional(12.0), Color32::WHITE);
+        }
+        // Camera: effective layout as fill, explicit ranges outlined.
+        if self.project.camera_size.is_some() {
+            for (mode, color) in [(CameraMode::Full, CAMERA_FULL), (CameraMode::Pip, CAMERA_PIP)] {
+                for r in self.project.camera_intervals(mode) {
+                    painter.rect_filled(self.span(cam, r.start, r.end), 2.0, color);
+                }
+            }
+            for r in &self.project.camera_ranges {
+                painter.rect_stroke(self.span(cam, r.start, r.end), 2.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
+            }
+        }
         for o in &self.project.overlays {
             let r = self.span(lane, o.start, o.end).shrink2(vec2(0.0, 2.0));
             painter.rect_filled(r, 3.0, OVERLAY_BAR);
@@ -740,9 +1118,12 @@ impl Editor {
             && let Some(p) = response.interact_pointer_pos()
         {
             let t = self.x_to_t(rect, p.x);
-            match self.overlay_at(lane, p, t) {
-                Some(i) => self.edit_overlay(i),
-                None => self.seek(t),
+            if let Some(i) = self.overlay_at(lane, p, t) {
+                self.edit_overlay(i);
+            } else if let Some(i) = self.slide_at_lane(visual, p, t) {
+                self.edit_slide(i);
+            } else {
+                self.seek(t);
             }
         }
         if response.secondary_clicked()
@@ -751,6 +1132,14 @@ impl Editor {
             let t = self.x_to_t(rect, p.x);
             if let Some(i) = self.overlay_at(lane, p, t) {
                 self.edit_overlay(i);
+            } else if let Some(i) = self.slide_at_lane(visual, p, t) {
+                self.edit_slide(i);
+            } else if cam.expand2(vec2(0.0, 2.0)).contains(p)
+                && let Some(i) = self.project.camera_ranges.iter().rposition(|r| r.start <= t && t < r.end)
+            {
+                self.edit(|p| {
+                    p.camera_ranges.remove(i);
+                });
             } else if let Some(i) = self.project.cut_at(t) {
                 self.edit(|p| {
                     p.cuts.remove(i);
@@ -758,7 +1147,7 @@ impl Editor {
             }
         }
         response.on_hover_text_at_pointer(
-            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan\nRight-click a red cut to restore it · Click an overlay bar to edit it",
+            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan\nRight-click a red cut to restore it · Click a slide (purple) or overlay (green) bar to edit it\nCamera strip: orange = only me, brown = small window; right-click an outlined range to remove it",
         );
     }
 
@@ -795,6 +1184,13 @@ impl Editor {
             let x = self.t_to_x(wave, w.start);
             painter.line_segment([pos2(x, wave.top()), pos2(x, wave.bottom())], guide);
         }
+    }
+
+    fn slide_at_lane(&self, lane: Rect, p: Pos2, t: f64) -> Option<usize> {
+        if !lane.contains(p) {
+            return None;
+        }
+        self.project.slide_at(t)
     }
 
     fn overlay_at(&self, lane: Rect, p: Pos2, t: f64) -> Option<usize> {
@@ -919,6 +1315,9 @@ impl Editor {
                             seek = Some(c.start);
                         }
                         ui.weak(format!("{:.1}s", c.len()));
+                        if !c.note.is_empty() {
+                            ui.weak(&c.note);
+                        }
                         if ui.small_button("Restore").clicked() {
                             restore = Some(i);
                         }
@@ -940,8 +1339,50 @@ impl Editor {
                     });
                 }
             });
+        let mut edit_slide = None;
+        egui::CollapsingHeader::new(format!("Slides ({})", self.project.slides.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for (i, s) in self.project.slides.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.link(format!("{} – {}", fmt_time(s.start), fmt_time(s.end))).clicked() {
+                            seek = Some(s.start);
+                        }
+                        ui.label(s.file.file_name().unwrap_or_default().to_string_lossy());
+                        if ui.small_button("Edit").clicked() {
+                            edit_slide = Some(i);
+                        }
+                    });
+                }
+            });
+        let mut remove_camera = None;
+        if self.project.camera_size.is_some() {
+            egui::CollapsingHeader::new(format!("Camera ({}, otherwise {})", self.project.camera_ranges.len(), self.project.camera.default.label().to_lowercase()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (i, r) in self.project.camera_ranges.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.link(format!("{} – {}", fmt_time(r.start), fmt_time(r.end))).clicked() {
+                                seek = Some(r.start);
+                            }
+                            ui.label(r.mode.label());
+                            if ui.small_button("Remove").clicked() {
+                                remove_camera = Some(i);
+                            }
+                        });
+                    }
+                });
+        }
         if let Some(t) = seek {
             self.seek(t);
+        }
+        if let Some(i) = edit_slide {
+            self.edit_slide(i);
+        }
+        if let Some(i) = remove_camera {
+            self.edit(|p| {
+                p.camera_ranges.remove(i);
+            });
         }
         if let Some(i) = restore {
             self.edit(|p| {
@@ -977,10 +1418,9 @@ pub fn new_project(media: &Path, segment_starts: Vec<f64>) -> Result<Project> {
         height: info.height,
         fps: info.fps,
         has_audio: info.has_audio,
+        camera_size: info.camera,
         segment_starts,
-        words: Vec::new(),
-        cuts: Vec::new(),
-        overlays: Vec::new(),
+        ..Default::default()
     })
 }
 

@@ -29,10 +29,20 @@ pub fn tool(name: &str) -> PathBuf {
         .iter()
         .map(|d| d.join(name))
         .chain(EXTRA_BIN_DIRS.iter().map(|d| Path::new(d).join(name)))
+        .chain(
+            BUNDLED_TOOLS.iter().filter(|(tool, _)| *tool == name).map(|(_, path)| PathBuf::from(path)),
+        )
         .find(|p| is_executable(p))
         // Fall back to the bare name so the error says "ffmpeg", not a guess.
         .unwrap_or_else(|| PathBuf::from(name))
 }
+
+/// Tools that ship inside a macOS application bundle rather than on `PATH`.
+/// LibreOffice is the one scribecut shells out to, for presentation slides.
+const BUNDLED_TOOLS: [(&str, &str); 2] = [
+    ("soffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+    ("soffice", "/opt/homebrew/bin/soffice"),
+];
 
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
@@ -55,6 +65,8 @@ pub struct ProbeInfo {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    /// Size of a second video stream (scribecut's camera track), if any.
+    pub camera: Option<(u32, u32)>,
 }
 
 pub fn probe(path: &Path) -> Result<ProbeInfo> {
@@ -69,10 +81,12 @@ pub fn probe(path: &Path) -> Result<ProbeInfo> {
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let streams = v["streams"].as_array().cloned().unwrap_or_default();
-    let video = streams
+    let videos: Vec<&serde_json::Value> = streams
         .iter()
-        .find(|s| s["codec_type"] == "video")
-        .context("no video stream")?;
+        .filter(|s| s["codec_type"] == "video" && s["disposition"]["attached_pic"] != 1)
+        .collect();
+    let video = *videos.first().context("no video stream")?;
+    let size = |v: &serde_json::Value| (v["width"].as_u64().unwrap_or(0) as u32, v["height"].as_u64().unwrap_or(0) as u32);
     let duration = v["format"]["duration"]
         .as_str()
         .and_then(|d| d.parse().ok())
@@ -85,10 +99,11 @@ pub fn probe(path: &Path) -> Result<ProbeInfo> {
         .unwrap_or(30.0);
     Ok(ProbeInfo {
         duration,
-        width: video["width"].as_u64().unwrap_or(0) as u32,
-        height: video["height"].as_u64().unwrap_or(0) as u32,
+        width: size(video).0,
+        height: size(video).1,
         fps,
         has_audio: streams.iter().any(|s| s["codec_type"] == "audio"),
+        camera: videos.get(1).map(|v| size(v)),
     })
 }
 
@@ -110,7 +125,8 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .args(["-nostdin", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list)
-        .args(["-c", "copy"])
+        // All streams: ffmpeg would otherwise keep only one video (the camera, being larger).
+        .args(["-map", "0", "-c", "copy"])
         .arg(out)
         .status()
         .context("running ffmpeg concat")?;

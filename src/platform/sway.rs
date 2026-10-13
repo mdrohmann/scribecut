@@ -86,6 +86,20 @@ pub fn focus_window(id: i64, _pid: i32) -> Result<Area> {
         .context("that window no longer exists")
 }
 
+/// Sets the pointer theme and size on all seats.
+pub fn set_cursor(theme: &str, size: u32) -> Result<()> {
+    let ok = Command::new("swaymsg")
+        .args(["seat", "*", "xcursor_theme", theme, &size.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()?
+        .success();
+    if !ok {
+        bail!("swaymsg could not set the cursor size");
+    }
+    Ok(())
+}
+
 pub fn outputs() -> Result<Vec<Output>> {
     Ok(swaymsg("get_outputs")?
         .as_array()
@@ -108,14 +122,21 @@ pub fn pick_region() -> Result<Option<Area>> {
     slurp(&["-f", "%x %y %w %h"], None)
 }
 
-/// Lets the user click one of the given windows. `None` if cancelled.
-pub fn click_window(windows: &[Window]) -> Result<Option<Area>> {
-    let boxes: String = windows
+/// Lets the user click one of the given windows; returns its container id.
+/// `None` if cancelled.
+pub fn click_window(windows: &[Window]) -> Result<Option<i64>> {
+    let visible: Vec<&Window> = windows.iter().filter(|w| w.visible).collect();
+    let boxes: String = visible
         .iter()
-        .filter(|w| w.visible)
         .map(|w| format!("{},{} {}x{}\n", w.area.x, w.area.y, w.area.w, w.area.h))
         .collect();
-    slurp(&["-r", "-f", "%x %y %w %h"], Some(boxes))
+    let picked = slurp(&["-r", "-f", "%x %y %w %h"], Some(boxes))?;
+    Ok(picked.and_then(|a| visible.iter().find(|w| w.area == a).map(|w| w.id)))
+}
+
+/// Whether a window is on a visible workspace; `None` if it no longer exists.
+pub fn window_visible(id: i64) -> Result<Option<bool>> {
+    Ok(windows()?.into_iter().find(|w| w.id == id).map(|w| w.visible))
 }
 
 fn slurp(args: &[&str], input: Option<String>) -> Result<Option<Area>> {

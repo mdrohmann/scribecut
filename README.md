@@ -7,8 +7,10 @@ Runs on Linux (sway / xdg-desktop-portal) and macOS.
 
 ```sh
 cargo run --release                       # home screen: record or open
-cargo run --release -- video.mkv          # open a video (or its .scribecut.json) directly
+cargo run --release -- video.mkv          # open a video (or its .edit.toml) directly
 cargo run --release -- video.mkv --export out.mp4   # render the saved edits without a window
+cargo run --release -- video.mkv --script out.md    # write the edited transcript as a script
+cargo run --release -- video.mkv --check            # validate video.edit.toml (after editing it by hand)
 ```
 
 On macOS, record through an app bundle instead — see [macOS](#macos) below.
@@ -16,7 +18,8 @@ On macOS, record through an app bundle instead — see [macOS](#macos) below.
 ## Installing
 
 Everywhere: `ffmpeg` (with `ffprobe`), GStreamer (for playback), plus `cmake` and a C/C++
-compiler to build whisper.cpp.
+compiler to build whisper.cpp. Slides need `pdfinfo` and `pdftoppm` (poppler) for PDFs and
+LibreOffice for presentations; without them the other slide kinds still work.
 
 The Whisper model (`small.en`, ~480 MB) is downloaded on first transcription to
 `~/.local/share/scribecut/models/` (`~/Library/Application Support/scribecut/models/` on
@@ -26,17 +29,21 @@ non-English).
 ### Linux
 
 GStreamer good/ugly plugins (`pipewiresrc`, `x264enc`, `opusenc`, `matroskamux`), a
-ScreenCast portal (`xdg-desktop-portal-wlr` on sway), `fc-match` for the overlay font, and
-`slurp` for region recording.
+ScreenCast portal (`xdg-desktop-portal-wlr` on sway), `fc-match` for the overlay font,
+`slurp` for region recording, and `dunstctl` to mute notifications while recording.
+The camera is read from `/dev/video0` by default.
 
 ### macOS
 
 ```sh
 sudo port install pkgconfig cmake ffmpeg gstreamer1 \
     gstreamer1-gst-plugins-base gstreamer1-gst-plugins-good gstreamer1-gst-libav
+# optional, for slides:
+sudo port install poppler          # PDF slides
 ```
 
-(Homebrew equivalents work too: `brew install pkg-config cmake ffmpeg gstreamer`.)
+(Homebrew equivalents work too: `brew install pkg-config cmake ffmpeg gstreamer poppler`.)
+LibreOffice is found in `/Applications` if it is installed; presentation slides need it.
 
 Then build the app bundle and launch it:
 
@@ -56,26 +63,54 @@ so `cargo run` is fine for that.
 Because the bundle is only ad-hoc signed, its identity changes whenever the binary does,
 so macOS may ask for permission again after a rebuild.
 
+The camera is an AVFoundation device, named rather than numbered (its index moves as
+devices come and go), so `camera_device` in the settings holds something like
+`FaceTime HD Camera`; a partial name or a bare index works too. Two things sway can do and
+macOS cannot: enlarging the pointer for the duration of a recording, and muting
+notifications — turn on Do Not Disturb yourself before recording.
+
 ## Recording
 
 Pick what to record:
 
 - **Full screen** – choose a monitor in the system's sharing dialog (Linux) or in
   scribecut's own list when more than one is attached (macOS).
-- **Window** – choose from a list of open windows (browsers first, filterable by title).
-  Neither sway's portal (as of 1.11) nor macOS' AVFoundation can hand out a single window,
-  so scribecut records the monitor cropped to the window: keep it in place and uncovered
-  while recording. On Linux, windows on another workspace are brought to the front first,
-  or you can click one on screen (needs `slurp`). On macOS the window's application is
-  brought to the front, but raising one specific window of another app is not possible
-  without Accessibility permission, so put the window in front yourself first. On desktops
-  whose portal shares windows, its own picker is used.
+- **Window** – where the screen-sharing portal can share single windows (GNOME, KDE,
+  sway ≥ 1.12), its own picker is used and the recording follows the window, whatever
+  covers it or whichever desktop you are on. Where it cannot — sway 1.11, and macOS, whose
+  AVFoundation only hands out whole displays — scribecut lists the open windows (browsers
+  first, filterable by title, or click one on screen on sway), brings the chosen one to the
+  front and records the monitor cropped to it. Keep it in place; the recording pauses
+  automatically while the window is not visible and resumes when it is. On macOS the
+  window's *application* is brought forward, since raising one particular window of another
+  app needs Accessibility permission, so put the right window in front yourself first.
 - **Region** – drag out a rectangle. On Linux this uses `slurp`; on macOS scribecut dims
-  the screen and you drag on it directly (the menu bar stays on top, so start the drag
-  below it).
+  the screen and you drag on it directly (the menu bar stays on top, so start below it).
 
-For window and region recordings on Linux the monitor choice is remembered, so the portal
-dialog usually only appears once.
+For window and region recordings the monitor choice is remembered on Linux, so the portal
+dialog usually only appears once. dunst notifications are paused while recording and
+restored afterwards; macOS has no equivalent, so turn on Do Not Disturb yourself.
+
+Options on the home screen (saved in `~/.config/scribecut/settings.toml`):
+
+- **Record camera** – records the webcam as a second video track of the same file, in sync
+  with screen and mic. Whether you appear is decided per part of the video when editing.
+  `camera_device` is a V4L2 node on Linux (default `/dev/video0`) and an AVFoundation
+  device name on macOS (e.g. `FaceTime HD Camera`; a partial name or a bare index also
+  works). If the camera is busy the recording carries on without it and says so.
+- **Bigger pointer** (sway) – doubles the mouse pointer size while recording
+  (`pointer_scale`) and restores it afterwards. Apps that draw their own pointer may keep
+  theirs. macOS only has a global accessibility setting that needs apps restarted, so the
+  option is hidden there.
+
+On sway ≥ 1.12, xdg-desktop-portal-wlr's default picker only offers monitors. To pick
+windows, use a dmenu-style chooser in `~/.config/xdg-desktop-portal-wlr/config`:
+
+```ini
+[screencast]
+chooser_type=dmenu
+chooser_cmd=rofi -dmenu -p Share
+```
 
 Then Pause / Resume as often as you like → Stop & edit. Each piece is saved to
 `~/Videos/scribecut/<timestamp>/` (`~/Movies/scribecut/...` on macOS), joined into
@@ -130,10 +165,33 @@ drops those stages instead of failing the export.
 | Edit overlay | Click its green bar on the timeline, or "Edit" in the list |
 | Undo | `Ctrl+Z` (`Cmd+Z` on macOS) |
 | Zoom / pan timeline | Mouse wheel / Shift+wheel |
+| Slides | "+ Slide…" → pick an image, PDF, presentation (.pptx/.odp/.key, converted with LibreOffice) or video clip; it replaces the screen recording for the selection. Set the page (or the clip's start) in the dialog; click its purple bar to edit |
+| Camera | "Camera" menu → for the selection: Only me / Small window / Hide me; also the layout everywhere else and the small window's corner. Right-click an outlined range on the camera strip to remove it |
 | Export | "Export…" → MP4 (H.264/AAC) |
+| Script | "Export script…" → Markdown of the transcript after cuts: paragraphs at pauses with their time in the edited video, `---` between recorded pieces, `[On screen: …]` notes for overlays. Handy as a script for re-recording |
 
-Playback skips cuts and shows overlays, so the preview matches the export. Edits are saved
-automatically to `<video>.scribecut.json`.
+Playback skips cuts and shows slides, camera and overlays, so the preview matches the export
+(layering: screen < slide < camera < text).
+
+## Editing with text files (or an agent)
+
+All edit state is plain text next to the video, so you can change it in an editor or have an agent do it:
+
+- `<video>.edit.toml` – cuts (with optional notes), slides, camera layout and overlays. Its header
+  explains the format. Times are `"m:ss.s"` strings on the original recording's timeline, so cuts never
+  shift other times. scribecut reloads the file within a second when it changes on disk; mistakes are
+  reported in the app and the previous state is kept.
+- `<video>.transcript.txt` – the words, one phrase per line with its time (`[02:19.36] and we want…`),
+  to find where things are said. `<video>.transcript.json` has every word's timing.
+- `scribecut <video> --check` – validates the edit file (times, files, PDF pages) and exits non-zero on
+  problems; run it after each change. `--export out.mp4` renders without the UI.
+
+Example instruction for an agent: *"In recording.transcript.txt find where I say 'battery decline tab';
+show slides/deck.pdf page 3 from there for 20 seconds, with me in the small window; then run --check."*
+
+Rendered PDF pages, converted presentations and video poster frames are cached in `.scribecut-cache/`.
+Projects from older versions (`<video>.scribecut.json`) are converted on open (the old file is kept as
+`.json.bak`).
 
 Overlays are drawn with a bold sans face found via `fc-match`, falling back to a face
 shipped with the OS; `SCRIBECUT_FONT=/path/to/font.ttf` picks one explicitly. The same file

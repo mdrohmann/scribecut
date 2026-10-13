@@ -12,9 +12,9 @@ mod macos;
 mod sway;
 
 #[cfg(target_os = "macos")]
-pub use macos::{available, focus_window, outputs, windows};
+pub use macos::{available, focus_window, outputs, window_visible, windows};
 #[cfg(target_os = "linux")]
-pub use sway::{available, click_window, focus_window, outputs, pick_region, windows};
+pub use sway::{available, click_window, focus_window, outputs, pick_region, set_cursor, window_visible, windows};
 
 /// How the user drags out a rectangle to record on this desktop.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,11 @@ pub fn region_picker() -> RegionPicker {
 /// Whether the user can pick a window by clicking it on screen.
 pub const CAN_CLICK_WINDOW: bool = cfg!(target_os = "linux");
 
+/// Whether the pointer can be enlarged for the duration of a recording. sway
+/// can be told to; macOS only has a global accessibility setting that needs
+/// applications to be restarted, which is no use for a recording.
+pub const CAN_SET_POINTER_SIZE: bool = cfg!(target_os = "linux");
+
 /// Stand-ins for the external pickers, so callers need no `cfg` of their own:
 /// where [`region_picker`] is not [`RegionPicker::External`] these are unused.
 #[cfg(not(target_os = "linux"))]
@@ -53,7 +58,7 @@ mod external {
         bail!("this desktop has no external region picker")
     }
 
-    pub fn click_window(_windows: &[Window]) -> Result<Option<Area>> {
+    pub fn click_window(_windows: &[Window]) -> Result<Option<i64>> {
         bail!("this desktop cannot pick a window by clicking it")
     }
 }
