@@ -1,8 +1,16 @@
 //! macOS capture. AVFoundation only hands out whole displays, so there is no
 //! portal session to hold open: each segment is one ffmpeg process grabbing the
-//! display (and the microphone, and optionally the camera) and encoding H.264
-//! in hardware with VideoToolbox. Cropping to a window or region happens in
-//! that same process.
+//! display (and optionally the camera) and encoding H.264 in hardware with
+//! VideoToolbox. Cropping to a window or region happens in that same process.
+//!
+//! The microphone does **not** come from ffmpeg. Its AVFoundation audio input
+//! drops 8 to 22 per cent of its samples even with nothing else running --
+//! measured at 4 per cent of one core, writing uncompressed, with no screen
+//! capture in the process -- and the demuxer exposes nothing to tune. Padding
+//! the gaps afterwards only buys the right duration around missing speech. So
+//! the microphone is recorded through GStreamer's CoreAudio source, which
+//! captured everything in the same test, and muxed with the picture when the
+//! segment ends.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use gst::prelude::*;
 
 use super::{Source, join_pieces};
 use crate::geom::{Crop, Output};
@@ -22,8 +31,8 @@ use crate::settings::Settings;
 pub struct Connection {
     /// ffmpeg's AVFoundation video device index for this display.
     screen: usize,
-    /// AVFoundation audio device index, if there is a microphone.
-    audio: Option<usize>,
+    /// Whether there is a microphone to record at all.
+    has_audio: bool,
     /// The display's full frame size in pixels, which a crop is measured against.
     pixels: (i32, i32),
     crop: Option<Crop>,
@@ -45,7 +54,8 @@ struct Devices {
     screens: Vec<usize>,
     /// Video devices that are not screens, i.e. cameras, with their names.
     cameras: Vec<(usize, String)>,
-    /// Audio input device indices.
+    /// Audio input device indices. Only their presence matters: the microphone
+    /// is captured by GStreamer, which uses the system's default input.
     audio: Vec<usize>,
 }
 
@@ -67,7 +77,7 @@ fn devices() -> Result<Devices> {
         bail!(
             "ffmpeg found no screen capture device. Grant Screen Recording permission \
              in System Settings > Privacy & Security > Screen & System Audio Recording, \
-             then restart scribecut.\n{}",
+             and check the display is awake, then restart scribecut.\n{}",
             text.trim()
         );
     }
@@ -161,7 +171,7 @@ fn find_camera(devices: &Devices, device: &str) -> Option<usize> {
 /// system dialog here, so nothing blocks on the user.
 pub fn connect(source: Source) -> Result<Connection> {
     let devices = devices()?;
-    let audio = devices.audio.first().copied();
+    let has_audio = !devices.audio.is_empty();
     let outputs = platform::outputs()?;
     let (output, crop, watch) = match source {
         Source::Monitor(chosen) => {
@@ -184,7 +194,7 @@ pub fn connect(source: Source) -> Result<Connection> {
         }
     };
     let screen = screen_device(&devices, &outputs, &output)?;
-    Ok(Connection { screen, audio, pixels: output.pixels, crop, name: output.name, watch })
+    Ok(Connection { screen, has_audio, pixels: output.pixels, crop, name: output.name, watch })
 }
 
 /// H.264 encoder for the recording. VideoToolbox encodes in hardware, which
@@ -204,10 +214,62 @@ fn bitrate() -> String {
 /// the device takes a moment to warm up and the first keyframe to be written.
 const STALL_AFTER: Duration = Duration::from_secs(8);
 
-/// The ffmpeg process recording the current segment.
-struct Running {
-    child: Child,
+/// Microphone capture through GStreamer's CoreAudio source, written to its own
+/// uncompressed file and muxed with the picture when the segment ends.
+struct Microphone {
+    pipeline: gst::Pipeline,
     path: PathBuf,
+}
+
+impl Microphone {
+    fn start(path: &Path) -> Result<Self> {
+        let pipeline = gst::parse::launch(&format!(
+            "osxaudiosrc name=mic ! audioconvert ! audioresample \
+             ! audio/x-raw,format=S16LE,rate=48000,channels=1 ! wavenc \
+             ! filesink location=\"{}\"",
+            path.display()
+        ))
+        .context("building the microphone pipeline")?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("not a pipeline"))?;
+        pipeline.set_state(gst::State::Playing).context("starting the microphone")?;
+        Ok(Self { pipeline, path: path.to_path_buf() })
+    }
+
+    /// Any error the pipeline has reported.
+    fn error(&self) -> Option<String> {
+        let msg = self.pipeline.bus()?.pop_filtered(&[gst::MessageType::Error])?;
+        match msg.view() {
+            gst::MessageView::Error(e) => Some(format!("microphone: {}", e.error())),
+            _ => None,
+        }
+    }
+
+    /// Finishes the file. `wavenc` has to go back and write the data length, so
+    /// this waits for the pipeline to see the end of the stream.
+    fn stop(self) -> Result<PathBuf> {
+        self.pipeline.send_event(gst::event::Eos::new());
+        if let Some(bus) = self.pipeline.bus() {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(5),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+        }
+        let _ = self.pipeline.set_state(gst::State::Null);
+        Ok(self.path)
+    }
+}
+
+/// The processes recording the current segment.
+struct Running {
+    /// ffmpeg, recording the screen and optionally the camera.
+    child: Child,
+    /// Where ffmpeg writes; without a microphone this is the segment itself.
+    video: PathBuf,
+    /// The microphone, recorded separately.
+    mic: Option<Microphone>,
+    /// Where the finished segment goes once the two are muxed.
+    segment: PathBuf,
     stderr: Arc<Mutex<String>>,
     /// When ffmpeg was spawned, to notice a segment that never grows.
     started: Instant,
@@ -216,7 +278,7 @@ struct Running {
 /// Recording state shared between the UI and the window watcher.
 struct Segments {
     screen: usize,
-    audio: Option<usize>,
+    has_audio: bool,
     pixels: (i32, i32),
     crop: Option<Crop>,
     display: String,
@@ -241,28 +303,33 @@ impl Segments {
         if self.current.is_some() {
             return Ok(());
         }
-        let path = self.dir.join(format!("segment_{:03}.mkv", self.files.len()));
-        let running = match self.spawn(&path, self.camera) {
+        let index = self.files.len();
+        let segment = self.dir.join(format!("segment_{index:03}.mkv"));
+        let running = match self.spawn(index, &segment, self.camera) {
             Ok(running) => running,
             Err(e) if self.camera.is_some() => {
                 // Busy or missing camera: keep recording the screen.
                 self.warning = Some(format!("Camera unavailable, recording without it: {e:#}"));
                 self.camera = None;
-                self.spawn(&path, None)?
+                self.spawn(index, &segment, None)?
             }
             Err(e) => return Err(e),
         };
-        self.files.push(path);
+        self.files.push(segment);
         self.current = Some(running);
         Ok(())
     }
 
-    /// One ffmpeg process per segment: the display, the microphone and
-    /// optionally the camera, all into one file so they share a clock.
-    fn spawn(&self, path: &Path, camera: Option<usize>) -> Result<Running> {
+    /// Starts both halves of a segment: ffmpeg for the picture, GStreamer for
+    /// the microphone.
+    fn spawn(&self, index: usize, segment: &Path, camera: Option<usize>) -> Result<Running> {
+        // With a microphone the picture goes to its own file first, because the
+        // two are muxed together afterwards.
+        let video =
+            if self.has_audio { self.dir.join(format!("segment_{index:03}.video.mkv")) } else { segment.to_path_buf() };
+
         let mut cmd = crate::media::ffmpeg();
         cmd.args(["-hide_banner", "-v", "error", "-nostats"]);
-
         // The display. Two things are deliberate here. No input `-framerate`:
         // AVFoundation screen devices advertise no frame rates, so asking for
         // one makes ffmpeg refuse the device, and the output `-r` below makes
@@ -272,16 +339,9 @@ impl Segments {
         // yuv420p, which the device rejects before falling back.
         cmd.args(["-f", "avfoundation", "-capture_cursor", "1", "-pixel_format", "nv12"])
             .args(["-i", &self.screen.to_string()]);
-        // Inputs go in a fixed order so the stream indices below hold.
-        let camera_input = camera.map(|index| {
-            cmd.args(["-f", "avfoundation", "-framerate", "30"]).args(["-i", &index.to_string()]);
+        let camera_input = camera.map(|device| {
+            cmd.args(["-f", "avfoundation", "-framerate", "30"]).args(["-i", &device.to_string()]);
             1usize
-        });
-        // The microphone, as its own input: opening a display and a microphone
-        // in one AVFoundation session often fails to start.
-        let audio_input = self.audio.map(|index| {
-            cmd.args(["-f", "avfoundation", "-i", &format!(":{index}")]);
-            if camera_input.is_some() { 2usize } else { 1usize }
         });
 
         // The screen track comes first so it is the file's first video track,
@@ -299,10 +359,6 @@ impl Segments {
         if let Some(input) = camera_input {
             cmd.args(["-map", &format!("{input}:v")]);
         }
-        if let Some(input) = audio_input {
-            cmd.args(["-map", &format!("{input}:a")]);
-        }
-
         // No `-pix_fmt`: ffmpeg converts if the encoder needs it, and asking
         // for one here would override the native nv12 path above.
         cmd.args(["-r", "30"]).args(["-c:v", &encoder(), "-g", "60"]);
@@ -312,24 +368,7 @@ impl Segments {
             // the screen does.
             cmd.args(["-b:v:1", "3M"]);
         }
-        if audio_input.is_some() {
-            // Raising `-thread_queue_size` and taking timestamps from the wall
-            // clock both look like the obvious fixes here and both measured
-            // worse: a 1024-packet queue of 12 MB screen frames is gigabytes
-            // and the pipeline thrashes, and wallclock stamps with the
-            // constant-rate conversion above lost two thirds of the frames.
-            //
-            // The microphone's packets arrive with gaps, and left alone ffmpeg
-            // writes them back to back: the recording then sounds chopped up
-            // and its audio track ends well before the video. Measured on a
-            // 10 s capture, 1.14 s of a 8.33 s recording went missing that way,
-            // and far more when the screen is in the same process. Resampling
-            // asynchronously pads the gaps with silence instead, which keeps
-            // the track the same length as the picture and in step with it.
-            cmd.args(["-af", "aresample=async=1:first_pts=0"]);
-            cmd.args(["-c:a", "aac", "-b:a", "160k"]);
-        }
-        cmd.args(["-f", "matroska"]).arg(path);
+        cmd.args(["-f", "matroska"]).arg(&video);
         // stdin stays open: `q` on it is how ffmpeg is asked to finish the file.
         // It is a pipe, never the terminal, so a backgrounded scribecut is not
         // stopped by SIGTTOU.
@@ -346,7 +385,23 @@ impl Segments {
                 collected.lock().unwrap().push_str(&text);
             });
         }
-        let mut running = Running { child, path: path.to_path_buf(), stderr, started: Instant::now() };
+
+        let mic = if self.has_audio {
+            match Microphone::start(&self.dir.join(format!("segment_{index:03}.wav"))) {
+                Ok(mic) => Some(mic),
+                Err(e) => {
+                    // Better a silent recording than none.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut running =
+            Running { child, video, mic, segment: segment.to_path_buf(), stderr, started: Instant::now() };
         // A camera another app is holding makes ffmpeg exit almost at once, so
         // give it a moment and report that as the failure the caller falls back
         // on. Without the camera there is nothing to fall back to, so the
@@ -355,6 +410,9 @@ impl Segments {
             std::thread::sleep(Duration::from_millis(400));
             if matches!(running.child.try_wait(), Ok(Some(_))) {
                 let message = tail(&running.stderr);
+                if let Some(mic) = running.mic.take() {
+                    let _ = mic.stop();
+                }
                 bail!("{}", if message.is_empty() { "ffmpeg stopped".to_string() } else { message });
             }
         }
@@ -376,14 +434,36 @@ impl Segments {
         if !exited {
             let _ = run.child.kill();
             let _ = run.child.wait();
+        }
+
+        let mic = match run.mic.take() {
+            Some(mic) => Some(mic.stop()?),
+            None => None,
+        };
+
+        if !exited {
             bail!("timed out finalising segment");
         }
         // ffmpeg's exit code after `q` is not meaningful, so judge the segment
         // by whether it actually wrote a file.
-        if file_len(&run.path) > 1024 {
-            return Ok(());
+        if file_len(&run.video) <= 1024 {
+            bail!("recording failed: {}", tail(&run.stderr));
         }
-        bail!("recording failed: {}", tail(&run.stderr));
+        if let Some(mic) = mic {
+            // Both halves are stopped together, so however much more sound
+            // there is than picture was captured before the first frame: the
+            // microphone opens in a moment while the screen device takes a
+            // second or two. Measuring the two finished files is steadier than
+            // timing the starts, because Matroska buffers and the picture's
+            // file does not grow the instant frames begin arriving.
+            let video_len = crate::media::probe(&run.video).map(|i| i.duration).unwrap_or(0.0);
+            let audio_len = crate::media::audio_duration(&mic).unwrap_or(0.0);
+            let lead = (audio_len - video_len).clamp(0.0, 5.0);
+            mux(&run.video, &mic, lead, &run.segment)?;
+            let _ = std::fs::remove_file(&run.video);
+            let _ = std::fs::remove_file(&mic);
+        }
+        Ok(())
     }
 
     /// Follows the watched window: pause while hidden, resume when shown.
@@ -402,13 +482,16 @@ impl Segments {
         }
     }
 
-    /// Whichever problem ffmpeg has run into, if any.
+    /// Whichever problem the recording has run into, if any.
     fn poll_error(&mut self) -> Option<String> {
         if let Some(e) = self.error.take() {
             return Some(e);
         }
         let display = self.display.clone();
         let run = self.current.as_mut()?;
+        if let Some(e) = run.mic.as_ref().and_then(Microphone::error) {
+            return Some(e);
+        }
         // Still running is the normal case; anything else means ffmpeg gave up
         // (screen sharing revoked, disk full, device taken away).
         if let Ok(Some(status)) = run.child.try_wait() {
@@ -418,7 +501,7 @@ impl Segments {
         }
         // A missing permission makes AVFoundation block instead of fail, which
         // would otherwise leave a running timer above a file that never grows.
-        if run.started.elapsed() > STALL_AFTER && file_len(&run.path) == 0 {
+        if run.started.elapsed() > STALL_AFTER && file_len(&run.video) == 0 {
             return Some(format!(
                 "no frames have arrived from {display}. Grant Screen Recording (and Microphone) \
                  permission in System Settings > Privacy & Security, then restart scribecut - \
@@ -427,6 +510,29 @@ impl Segments {
         }
         None
     }
+}
+
+/// Puts the picture and the microphone into one file.
+///
+/// `lead` is how many seconds of sound were captured before the first frame;
+/// that much is dropped from the front so the two line up.
+fn mux(video: &Path, audio: &Path, lead: f64, out: &Path) -> Result<()> {
+    let mut cmd = crate::media::ffmpeg();
+    cmd.stdin(Stdio::null()).args(["-nostdin", "-y", "-v", "error", "-i"]).arg(video);
+    if lead > 0.01 {
+        cmd.args(["-ss", &format!("{lead:.3}")]);
+    }
+    cmd.args(["-i"])
+        .arg(audio)
+        // `0:v` takes every video track, so a camera track comes along too.
+        .args(["-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k"])
+        .args(["-f", "matroska"])
+        .arg(out);
+    let out_result = cmd.output().context("running ffmpeg to mux the segment")?;
+    if !out_result.status.success() {
+        bail!("could not mux the segment: {}", String::from_utf8_lossy(&out_result.stderr));
+    }
+    Ok(())
 }
 
 /// Polls the recorded window's visibility until dropped.
@@ -469,14 +575,14 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn new(conn: Connection, dir: PathBuf, settings: &Settings) -> Result<Self> {
-        let Connection { screen, audio, pixels, crop, name, watch } = conn;
+        let Connection { screen, has_audio, pixels, crop, name, watch } = conn;
         let camera = settings
             .record_camera
             .then(|| devices().ok().and_then(|d| find_camera(&d, &settings.camera_device)))
             .flatten();
         let segments = Arc::new(Mutex::new(Segments {
             screen,
-            audio,
+            has_audio,
             pixels,
             crop,
             display: name,
@@ -563,12 +669,16 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         drop(self.watcher.take());
-        // Never leave an ffmpeg holding the camera or the screen.
+        // Never leave an ffmpeg holding the camera or the screen, or a
+        // microphone pipeline running.
         if let Ok(mut s) = self.segments.lock()
             && let Some(mut run) = s.current.take()
         {
             let _ = run.child.kill();
             let _ = run.child.wait();
+            if let Some(mic) = run.mic.take() {
+                let _ = mic.stop();
+            }
         }
     }
 }
@@ -622,6 +732,9 @@ mod tests {
     /// hand the device to the next one, and without the wait the camera
     /// occasionally reads as busy.
     fn device_turn() -> std::sync::MutexGuard<'static, ()> {
+        // The microphone is a GStreamer pipeline, and only `main` initialises
+        // GStreamer in the real app. Doing it again is harmless.
+        gst::init().expect("GStreamer");
         let guard = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
         std::thread::sleep(Duration::from_millis(750));
         guard
@@ -758,17 +871,16 @@ mod tests {
         // packed together instead of padded, and the track ends early -- which
         // is what made the waveform and the transcript cover only part of the
         // recording, and what made it sound chopped up.
-        // Deliberately a loose bound rather than a tight one, because there is
-        // a known gap this does not fix: the screen device takes around two
-        // seconds to start delivering, the microphone is opened after it, and
-        // each segment therefore loses roughly that much sound off the front.
-        // What this does catch is the failure it was written for -- packing the
-        // microphone's packets together across their gaps, which left these
-        // same recordings with 60 to 97 per cent of the sound missing and made
-        // the waveform and the transcript cover a fraction of the video.
+        // The sound must now run as long as the picture, within a fraction of
+        // a second. Two separate failures used to show up here: ffmpeg's
+        // AVFoundation audio input silently dropping samples, which left these
+        // recordings with 60 to 97 per cent of the sound missing, and the
+        // microphone starting before the screen device, which shifted what was
+        // left. The microphone now comes from GStreamer and is lined up against
+        // the picture when the segment is muxed.
         let audio = crate::media::audio_duration(&file).unwrap();
         assert!(
-            audio > info.duration * 0.5,
+            (info.duration - audio).abs() < 0.8,
             "audio is {audio:.2}s against {:.2}s of video",
             info.duration
         );
@@ -846,7 +958,7 @@ mod tests {
         // worst, so this is the case most worth checking.
         let audio = crate::media::audio_duration(&file).unwrap();
         assert!(
-            audio > info.duration * 0.5,
+            (info.duration - audio).abs() < 0.8,
             "audio is {audio:.2}s against {:.2}s of video",
             info.duration
         );

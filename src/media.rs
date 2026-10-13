@@ -175,7 +175,6 @@ pub fn extract_audio_16k(path: &Path) -> Result<Vec<f32>> {
 /// Matroska stores no per-stream duration, so the only honest way to find out
 /// whether a recording's sound really runs as long as its picture is to decode
 /// the samples and count them.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn audio_duration(path: &Path) -> Result<f64> {
     const RATE: usize = 48_000;
     let mut child = ffmpeg()

@@ -128,18 +128,19 @@ through a voice cleanup chain first: a high-pass to clear the rumble, `speechnor
 to level the speech, gentle downward compression, and loudness normalisation to
 about -16 LUFS with a true-peak ceiling that leaves room for the AAC encoder.
 
-Recording the microphone alongside the screen needs asynchronous resampling
-(`aresample=async=1`) on macOS: AVFoundation delivers the microphone in bursts with
-gaps between them, and ffmpeg left to itself writes those packets back to back, which
-makes the sound chopped up and its track end well before the picture — taking the
-waveform and the transcript with it. Measured on a 14 second capture, the audio went
-from 85% of the video's length to 99%.
+On macOS the microphone is **not** captured by ffmpeg. Its AVFoundation audio input
+drops 8 to 22 per cent of its samples even with nothing else running — measured at 4
+per cent of one core, writing uncompressed, with no screen capture in the process —
+and the demuxer offers nothing to tune. That is what made recordings sound chopped up,
+and it took the waveform and the transcript with it, since both are derived from the
+audio track. Padding the gaps afterwards only buys the right duration around missing
+speech.
 
-A caveat that remains: the screen device takes roughly two seconds to start
-delivering frames and the microphone is opened after it, so each recorded piece loses
-about that much sound off the front. Long pieces hide it; pausing and resuming often
-does not. Capture throughput also varies with how busy the machine is — a
-full-resolution Retina screen is a lot of pixels to move every frame.
+So the microphone is recorded through GStreamer's CoreAudio source, which captured
+everything in the same test, and muxed with the picture when each piece ends. The
+screen device takes a second or two to start delivering while the microphone opens
+almost at once, so the extra sound at the front is trimmed: both halves stop together,
+which makes the difference in their lengths the right amount to drop.
 
 The recording itself is never processed — cleanup happens on the way out, so the
 original is always there to fall back on.
