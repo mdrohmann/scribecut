@@ -251,8 +251,6 @@ mod tests {
     #[test]
     #[ignore]
     fn cleans_up_a_realistically_bad_recording() {
-        use std::process::Command;
-
         let dir = std::env::temp_dir().join(format!("scribecut-audio-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let raw = dir.join("raw.wav");

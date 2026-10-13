@@ -28,7 +28,9 @@ pub use backend::{Recorder, camera_available, connect, default_camera};
 /// What to record.
 pub enum Source {
     /// A whole monitor: picked in the portal's dialog on Linux, named up front
-    /// on macOS, where the app has to offer the choice itself.
+    /// on macOS, where the app has to offer the choice itself. The portal asks
+    /// the user, so the Linux backend ignores the output named here.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Monitor(Option<Output>),
     /// A single window, chosen in the system's own picker. Only where
     /// [`supports_system_windows`] is true.

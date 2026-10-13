@@ -67,6 +67,10 @@ impl Crop {
     }
 
     /// The cropped size, given the full frame size it applies to.
+    ///
+    /// Only backends that have to state an output size need this: GStreamer's
+    /// `videocrop` is told the edges instead, so the Linux build never calls it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn size(&self, frame: (i32, i32)) -> (i32, i32) {
         ((frame.0 - self.left - self.right).max(2), (frame.1 - self.top - self.bottom).max(2))
     }

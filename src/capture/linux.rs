@@ -15,7 +15,7 @@ use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, S
 use gst::prelude::*;
 
 use super::{Source, join_pieces};
-use crate::geom::{Area, Crop, Output};
+use crate::geom::{Crop, Output};
 use crate::platform;
 use crate::settings::Settings;
 
@@ -178,8 +178,7 @@ pub fn connect(source: Source) -> Result<Connection> {
                 let _ = std::fs::write(file, token);
             }
             let crop = platform::crop_for(&area, &output);
-            let none = Crop { left: 0, top: 0, right: 0, bottom: 0 };
-            Ok(Connection { portal, crop: (crop != none).then_some(crop), watch: None })
+            Ok(Connection { portal, crop: (!crop.is_none()).then_some(crop), watch: None })
         }
     }
 }
