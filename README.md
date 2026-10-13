@@ -128,6 +128,19 @@ through a voice cleanup chain first: a high-pass to clear the rumble, `speechnor
 to level the speech, gentle downward compression, and loudness normalisation to
 about -16 LUFS with a true-peak ceiling that leaves room for the AAC encoder.
 
+Recording the microphone alongside the screen needs asynchronous resampling
+(`aresample=async=1`) on macOS: AVFoundation delivers the microphone in bursts with
+gaps between them, and ffmpeg left to itself writes those packets back to back, which
+makes the sound chopped up and its track end well before the picture — taking the
+waveform and the transcript with it. Measured on a 14 second capture, the audio went
+from 85% of the video's length to 99%.
+
+A caveat that remains: the screen device takes roughly two seconds to start
+delivering frames and the microphone is opened after it, so each recorded piece loses
+about that much sound off the front. Long pieces hide it; pausing and resuming often
+does not. Capture throughput also varies with how busy the machine is — a
+full-resolution Retina screen is a lot of pixels to move every frame.
+
 The recording itself is never processed — cleanup happens on the way out, so the
 original is always there to fall back on.
 

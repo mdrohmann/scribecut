@@ -170,6 +170,31 @@ pub fn extract_audio_16k(path: &Path) -> Result<Vec<f32>> {
         .collect())
 }
 
+/// Length of the audio track in seconds, measured by decoding it.
+///
+/// Matroska stores no per-stream duration, so the only honest way to find out
+/// whether a recording's sound really runs as long as its picture is to decode
+/// the samples and count them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn audio_duration(path: &Path) -> Result<f64> {
+    const RATE: usize = 48_000;
+    let mut child = ffmpeg()
+        .stdin(Stdio::null())
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "-"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("running ffmpeg")?;
+    let mut bytes = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut bytes)?;
+    if !child.wait()?.success() {
+        bail!("ffmpeg could not decode the audio track");
+    }
+    // Two bytes per sample.
+    Ok(bytes.len() as f64 / 2.0 / RATE as f64)
+}
+
 /// Loudness envelope resolution of [`audio_peaks`].
 pub const PEAKS_PER_SEC: usize = 100;
 
