@@ -24,10 +24,16 @@ pub struct Player {
 impl Player {
     /// `preview` is the size frames are scaled to before reaching the UI.
     pub fn new(path: &Path, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
-        let playbin = gst::ElementFactory::make("playbin").build()?;
-        let uri = gst::glib::filename_to_uri(path, None)?;
-        playbin.set_property("uri", uri.as_str());
+        Self::open(path, preview, ctx, 0, true)
+    }
 
+    /// Plays video stream `stream` (e.g. 1 = the camera track) without audio.
+    pub fn silent_stream(path: &Path, stream: i32, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
+        Self::open(path, preview, ctx, stream, false)
+    }
+
+    fn open(path: &Path, preview: (u32, u32), ctx: egui::Context, stream: i32, audio: bool) -> Result<Self> {
+        let uri = gst::glib::filename_to_uri(path, None)?;
         let (w, h) = preview;
         let bin = gst::parse::bin_from_description(
             &format!(
@@ -64,7 +70,19 @@ impl Player {
                 })
                 .build(),
         );
-        playbin.set_property("video-sink", &bin);
+        let playbin = if stream == 0 {
+            let playbin = gst::ElementFactory::make("playbin").property("uri", uri.as_str()).build()?;
+            if !audio {
+                let sink = gst::ElementFactory::make("fakesink").property("sync", true).build()?;
+                playbin.set_property("audio-sink", &sink);
+            }
+            playbin.set_property("video-sink", &bin);
+            playbin
+        } else {
+            // playbin's `current-video` doesn't reliably switch tracks, so decode
+            // the file ourselves and show only the wanted video stream.
+            stream_pipeline(uri.as_str(), stream, bin.upcast())?.upcast()
+        };
         playbin.set_state(gst::State::Paused).context("opening video")?;
         // Wait for preroll so the first frame shows and seeking works immediately.
         let _ = playbin.state(gst::ClockTime::from_seconds(5));
@@ -124,6 +142,37 @@ impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.playbin.set_state(gst::State::Null);
     }
+}
+
+/// Decodes `uri`, sending video stream number `stream` to `sink` and every
+/// other stream to a fakesink (unlinked streams would stop the demuxer).
+fn stream_pipeline(uri: &str, stream: i32, sink: gst::Element) -> Result<gst::Pipeline> {
+    let pipeline = gst::Pipeline::new();
+    let decode = gst::ElementFactory::make("uridecodebin").property("uri", uri).build()?;
+    pipeline.add_many([&decode, &sink])?;
+    let sink_pad = sink.static_pad("sink").context("no sink pad")?;
+    let videos = std::sync::atomic::AtomicI32::new(0);
+    let weak = pipeline.downgrade();
+    decode.connect_pad_added(move |_, pad| {
+        let Some(pipeline) = weak.upgrade() else { return };
+        let is_video = pad
+            .current_caps()
+            .or_else(|| Some(pad.query_caps(None)))
+            .and_then(|c| c.structure(0).map(|s| s.name().starts_with("video/")))
+            .unwrap_or(false);
+        if is_video && videos.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == stream && !sink_pad.is_linked() {
+            let _ = pad.link(&sink_pad);
+            return;
+        }
+        let Ok(fake) = gst::ElementFactory::make("fakesink").property("sync", true).build() else { return };
+        if pipeline.add(&fake).is_ok() {
+            let _ = fake.sync_state_with_parent();
+            if let Some(p) = fake.static_pad("sink") {
+                let _ = pad.link(&p);
+            }
+        }
+    });
+    Ok(pipeline)
 }
 
 fn to_frame(sample: &gst::Sample) -> Option<Frame> {

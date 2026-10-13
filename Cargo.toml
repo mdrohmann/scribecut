@@ -13,10 +13,12 @@ egui = "0.36.2"
 gst = { package = "gstreamer", version = "0.25.4" }
 gst-app = { package = "gstreamer-app", version = "0.25.2" }
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "sync"] }
+toml = "1.1.8"
 ureq = "3.4.2"
 whisper-rs = "0.16.0"
 

@@ -7,19 +7,17 @@ use std::time::Duration;
 use anyhow::Result;
 use egui::{Color32, RichText};
 
-use crate::capture::{Portal, Recorder, Source, connect, new_recording_dir};
+use crate::capture::{Recorder, Source, connect, new_recording_dir};
+use crate::settings::Settings;
 use crate::sway;
 use crate::editor::{Action, Editor, new_project};
-
-/// An open screen stream, plus the crop to apply to it.
-type Connected = (Portal, Option<sway::Crop>);
 
 enum Screen {
     Home,
     /// Choosing which window to record (sway).
     ChooseWindow { windows: Vec<sway::Window>, filter: String },
-    /// Waiting for the user to pick what to share; `None` means cancelled.
-    Picking(mpsc::Receiver<Result<Option<Connected>>>),
+    /// Picking what to record and starting it; `None` means cancelled.
+    Picking(mpsc::Receiver<Result<Option<Recorder>>>),
     Recording(Recorder),
     /// Joining segments after Stop.
     Finishing(mpsc::Receiver<Result<crate::project::Project>>),
@@ -31,12 +29,13 @@ pub struct App {
     error: Option<String>,
     /// The portal can share single windows itself (not on sway 1.11).
     portal_windows: bool,
+    settings: Settings,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, open: Option<PathBuf>) -> Self {
         install_overlay_font(&cc.egui_ctx);
-        let mut app = Self { screen: Screen::Home, error: None, portal_windows: crate::capture::portal_supports_windows() };
+        let mut app = Self { screen: Screen::Home, error: None, portal_windows: crate::capture::portal_supports_windows(), settings: Settings::load() };
         if let Some(path) = open {
             app.open(&path, &cc.egui_ctx);
         }
@@ -73,7 +72,8 @@ impl App {
                 .inner
                 .on_disabled_hover_text("Your desktop's screen-sharing portal can't share single windows");
             if window.clicked() {
-                if sway::available() {
+                // Prefer real window capture; on sway without it, crop the screen.
+                if !self.portal_windows && sway::available() {
                     match sway::windows() {
                         Ok(windows) => self.screen = Screen::ChooseWindow { windows, filter: String::new() },
                         Err(e) => self.error = Some(format!("Could not list windows: {e:#}")),
@@ -92,9 +92,26 @@ impl App {
                 self.start(ui.ctx(), || Ok(sway::pick_region()?.map(Source::Area)));
             }
             ui.add_space(8.0);
+            ui.add_space(4.0);
+            let before = self.settings.clone();
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() - 300.0).max(0.0) / 2.0);
+                let has_camera = self.settings.camera_available();
+                ui.add_enabled(has_camera, egui::Checkbox::new(&mut self.settings.record_camera, "Record camera"))
+                    .on_hover_text("Records you as a second video track; choose per part of the video whether to show it")
+                    .on_disabled_hover_text(format!("No camera at {}", self.settings.camera_device));
+                if sway::available() {
+                    ui.checkbox(&mut self.settings.big_pointer, "Bigger pointer")
+                        .on_hover_text("Doubles the mouse pointer size while recording");
+                }
+            });
+            if self.settings != before {
+                self.settings.save();
+            }
+            ui.add_space(8.0);
             if ui.add_sized([240.0, 32.0], egui::Button::new("Open video or project…")).clicked()
                 && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Video or project", &["mkv", "mp4", "webm", "mov", "json"])
+                    .add_filter("Video or project", &["mkv", "mp4", "webm", "mov", "toml", "json"])
                     .pick_file()
             {
                 self.open(&path, ui.ctx());
@@ -105,10 +122,14 @@ impl App {
     /// Picks what to record (off the UI thread: slurp and the portal block),
     /// then connects to the screen stream.
     fn start(&mut self, ctx: &egui::Context, pick: impl FnOnce() -> Result<Option<Source>> + Send + 'static) {
+        let settings = self.settings.clone();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = pick().and_then(|source| source.map(connect).transpose());
+            // Recording starts here rather than on the UI thread: picking a window
+            // on another workspace hides scribecut, and a hidden window gets no
+            // UI updates until it is shown again.
+            let result = pick().and_then(|source| source.map(|s| start_recording(s, &settings)).transpose());
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -164,10 +185,10 @@ impl App {
             });
         });
         if let Some(id) = chosen {
-            self.start(ui.ctx(), move || Ok(Some(Source::Area(sway::focus_window(id)?))));
+            self.start(ui.ctx(), move || Ok(Some(Source::SwayWindow(id))));
         } else if click {
             let windows = windows.to_vec();
-            self.start(ui.ctx(), move || Ok(sway::click_window(&windows)?.map(Source::Area)));
+            self.start(ui.ctx(), move || Ok(sway::click_window(&windows)?.map(Source::SwayWindow)));
         }
         back
     }
@@ -185,7 +206,17 @@ impl App {
             ui.label(RichText::new(label).size(22.0).color(color));
             let secs = rec.elapsed().as_secs();
             ui.label(RichText::new(format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)).size(48.0).monospace());
-            ui.label(format!("{} piece(s) · {}", rec.segments.len(), rec.dir.display()));
+            ui.label(format!("{} piece(s) · {}", rec.pieces(), rec.dir().display()));
+            if rec.has_camera() {
+                ui.label("Camera: recording");
+            } else if let Some(warning) = rec.warning() {
+                ui.colored_label(Color32::from_rgb(230, 180, 40), warning);
+            } else {
+                ui.weak("Camera: off (turn on \"Record camera\" on the home screen)");
+            }
+            if rec.is_waiting_for_window() {
+                ui.colored_label(Color32::from_rgb(230, 180, 40), "Paused while the recorded window is hidden - switch to it to continue");
+            }
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
@@ -217,20 +248,7 @@ impl eframe::App for App {
         let next = match rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) | Ok(Ok(None)) => Screen::Home,
-            Ok(Ok(Some((portal, crop)))) => {
-                let started = new_recording_dir().and_then(|dir| {
-                    let mut rec = Recorder::new(portal, crop, dir)?;
-                    rec.start_segment()?;
-                    Ok(rec)
-                });
-                match started {
-                    Ok(rec) => Screen::Recording(rec),
-                    Err(e) => {
-                        self.report(format!("Could not start recording: {e:#}"));
-                        Screen::Home
-                    }
-                }
-            }
+            Ok(Ok(Some(rec))) => Screen::Recording(rec),
             Ok(Err(e)) => {
                 self.report(format!("Recording was not started: {e:#}"));
                 Screen::Home
@@ -324,6 +342,13 @@ impl eframe::App for App {
             }
         };
     }
+}
+
+/// Connects to the screen stream and starts the first segment.
+fn start_recording(source: Source, settings: &Settings) -> Result<Recorder> {
+    let mut rec = Recorder::new(connect(source)?, new_recording_dir()?, settings)?;
+    rec.start_segment()?;
+    Ok(rec)
 }
 
 /// Loads the same font ffmpeg uses for overlays so the preview matches the export.
