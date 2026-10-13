@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
@@ -16,7 +16,16 @@ fn quote(s: &str) -> String {
 }
 
 /// Builds the `-filter_complex` graph. `text_files[i]` holds overlay i's text.
-pub fn filter_graph(p: &Project, text_files: &[PathBuf], font: Option<&Path>) -> String {
+///
+/// `audio_cleanup` is an ffmpeg filter chain applied to the finished programme,
+/// after the kept ranges have been joined, so that leveling and loudness see
+/// exactly what the viewer will hear rather than each piece separately.
+pub fn filter_graph(
+    p: &Project,
+    text_files: &[PathBuf],
+    font: Option<&Path>,
+    audio_cleanup: Option<&str>,
+) -> String {
     let mut g = String::new();
 
     // Overlays, applied on source timestamps before trimming.
@@ -58,7 +67,12 @@ pub fn filter_graph(p: &Project, text_files: &[PathBuf], font: Option<&Path>) ->
         .collect();
     let _ = write!(g, "{inputs}concat=n={n}:v=1:a={}[outv]", u8::from(p.has_audio));
     if p.has_audio {
-        g.push_str("[outa]");
+        match audio_cleanup {
+            Some(cleanup) => {
+                let _ = write!(g, "[acat];[acat]{cleanup}[outa]");
+            }
+            None => g.push_str("[outa]"),
+        }
     }
     g
 }
@@ -80,9 +94,10 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
         })
         .collect::<std::io::Result<_>>()?;
     let font = crate::media::overlay_font();
-    let graph = filter_graph(p, &text_files, font.as_deref());
+    let cleanup = crate::audio::cleanup();
+    let graph = filter_graph(p, &text_files, font.as_deref(), cleanup.as_deref());
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::media::ffmpeg();
     // -nostdin + null stdin: ffmpeg must not touch the terminal, or a
     // backgrounded scribecut gets stopped by SIGTTOU.
     cmd.stdin(Stdio::null())
@@ -118,7 +133,6 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
 mod tests {
     use super::*;
     use crate::project::{Overlay, Range};
-    use std::process::Command;
 
     fn project() -> Project {
         Project {
@@ -137,7 +151,7 @@ mod tests {
 
     #[test]
     fn graph_without_edits_is_single_piece() {
-        let g = filter_graph(&project(), &[], None);
+        let g = filter_graph(&project(), &[], None, None);
         assert_eq!(
             g,
             "[0:v]null[vov];[vov]split=1[vs0];[0:a]asplit=1[as0];\
@@ -161,7 +175,7 @@ mod tests {
             size: 0.1,
             color: [255, 0, 16],
         });
-        let g = filter_graph(&p, &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")));
+        let g = filter_graph(&p, &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None);
         assert!(g.starts_with("[0:v]drawtext=fontfile='/f/a b.ttf':textfile='/t/o0.txt':"));
         assert!(g.contains("fontsize=72:fontcolor=0xff0010:"));
         assert!(g.contains("x=w*0.25000-text_w/2:y=h*0.75000-text_h/2:enable='between(t,1.000,3.500)'[vov]"));
@@ -171,6 +185,23 @@ mod tests {
         assert!(!g.contains("asplit"));
     }
 
+    #[test]
+    fn audio_cleanup_runs_on_the_joined_programme() {
+        let mut p = project();
+        p.add_cut(Range::new(5.0, 8.0));
+        let g = filter_graph(&p, &[], None, Some("highpass=f=85,loudnorm=I=-14"));
+        // The cleanup must sit after the concat, not on each trimmed piece, so
+        // that leveling and loudness see the whole programme exactly once.
+        assert!(g.ends_with("concat=n=2:v=1:a=1[outv][acat];[acat]highpass=f=85,loudnorm=I=-14[outa]"), "{g}");
+        assert_eq!(g.matches("highpass").count(), 1, "{g}");
+
+        // A silent project has no audio chain to attach it to.
+        p.has_audio = false;
+        let g = filter_graph(&p, &[], None, Some("highpass=f=85"));
+        assert!(!g.contains("highpass"), "{g}");
+        assert!(!g.contains("[outa]"), "{g}");
+    }
+
     /// Renders a real clip with ffmpeg. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
@@ -178,7 +209,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scribecut-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("in.mkv");
-        let ok = Command::new("ffmpeg")
+        let ok = crate::media::ffmpeg()
             .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=20"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-c:v", "libx264", "-c:a", "libopus"])
             .arg(&src)
@@ -209,7 +240,7 @@ mod tests {
 
         // The overlay must change pixels at t=2 compared to the source frame.
         let grab = |file: &Path, t: &str| {
-            Command::new("ffmpeg")
+            crate::media::ffmpeg()
                 .args(["-v", "error", "-ss", t, "-i"])
                 .arg(file)
                 .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
