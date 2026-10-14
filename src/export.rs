@@ -158,7 +158,7 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
         .map(|(i, s)| sources::export_input(p, s).with_context(|| format!("slide {}", i + 1)))
         .collect::<Result<_>>()?;
     let clips: Vec<bool> = inputs.iter().map(|i| matches!(i, Input::Clip { .. })).collect();
-    let cleanup = crate::audio::cleanup();
+    let cleanup = crate::audio::cleanup(&p.media);
     let graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref());
 
     let mut cmd = crate::media::ffmpeg();
@@ -179,9 +179,15 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
     }
     cmd.args(["-filter_complex", &graph, "-map", "[outv]"]);
     if p.has_audio {
-        cmd.args(["-map", "[outa]", "-c:a", "aac", "-b:a", "160k"]);
+        // Stereo AAC-LC at 48 kHz: what Slack, browsers and phones all play.
+        // The microphone track is mono, which some players reject or play on
+        // one side only.
+        cmd.args(["-map", "[outa]", "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "48000"]);
     }
+    // H.264 High, 4:2:0, constant frame rate, `avc1` tag, index at the front
+    // (`+faststart`): the MP4 flavour Slack and browsers play inline.
     cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
+        .args(["-profile:v", "high", "-fps_mode", "cfr", "-tag:v", "avc1"])
         .args(["-movflags", "+faststart"])
         .arg(out)
         .stdout(Stdio::piped())
@@ -318,6 +324,16 @@ mod tests {
         let info = crate::media::probe(&out).unwrap();
         assert!((info.duration - 19.0).abs() < 0.15, "duration {}", info.duration);
         assert!(info.has_audio);
+        // The flavour Slack and browsers play inline.
+        let streams = Command::new(crate::media::tool("ffprobe"))
+            .args(["-v", "error", "-show_entries", "stream=codec_name,profile,pix_fmt,channels", "-of", "compact"])
+            .arg(&out)
+            .output()
+            .unwrap()
+            .stdout;
+        let streams = String::from_utf8_lossy(&streams);
+        assert!(streams.contains("codec_name=h264|profile=High|pix_fmt=yuv420p"), "{streams}");
+        assert!(streams.contains("codec_name=aac|profile=LC") && streams.contains("channels=2"), "{streams}");
 
         // Average colour of a frame region (fractions of the frame).
         let color = |file: &Path, t: f64, (x0, y0, x1, y1): (f64, f64, f64, f64)| -> [u8; 3] {

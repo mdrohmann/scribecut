@@ -150,6 +150,9 @@ pub struct Editor {
     /// Background-noise level in dB; the waveform is drawn from here up to 0 dB.
     waveform_floor_db: f32,
     waveform_job: Option<Job<Vec<f32>>>,
+    /// Renders the cleaned-up narration; playback switches to it when done.
+    clean_audio_job: Option<Job<Option<PathBuf>>>,
+    ctx: egui::Context,
     export: Option<Job<PathBuf>>,
     message: Option<String>,
     last_scrolled_word: Option<usize>,
@@ -198,6 +201,8 @@ impl Editor {
             waveform: Vec::new(),
             waveform_floor_db: -50.0,
             waveform_job: None,
+            clean_audio_job: None,
+            ctx: ctx.clone(),
             export: None,
             message: None,
             last_scrolled_word: None,
@@ -205,6 +210,8 @@ impl Editor {
         if editor.project.has_audio {
             let media = editor.project.media.clone();
             editor.waveform_job = Some(Job::spawn(ctx, "Waveform", move |_| crate::media::audio_peaks(&media)));
+            let media = editor.project.media.clone();
+            editor.clean_audio_job = Some(Job::spawn(ctx, "Cleaning audio", move |_| crate::audio::render_clean(&media)));
             if editor.project.words.is_empty() {
                 editor.start_transcription(ctx);
             }
@@ -389,6 +396,23 @@ impl Editor {
         action
     }
 
+    /// Swaps playback over to the cleaned-up narration, where it was.
+    fn play_with_audio(&mut self, audio: &Path) {
+        let preview = preview_size(self.project.width, self.project.height, 1600);
+        let ctx = self.ctx.clone();
+        match Player::with_audio(&self.project.media, audio, preview, ctx) {
+            Ok(mut player) => {
+                let (pos, playing) = (self.pos, self.player.playing);
+                player.seek(pos);
+                if playing {
+                    player.play();
+                }
+                self.player = player;
+            }
+            Err(e) => self.message = Some(format!("Playing the original audio: {e:#}")),
+        }
+    }
+
     /// Keeps the camera player playing in step with the main one.
     fn sync_camera(&mut self) {
         let Some(cam) = &mut self.camera else { return };
@@ -428,6 +452,16 @@ impl Editor {
     }
 
     fn poll_jobs(&mut self) {
+        if let Some(job) = &mut self.clean_audio_job
+            && let Some(result) = job.poll()
+        {
+            self.clean_audio_job = None;
+            match result {
+                Ok(Some(audio)) => self.play_with_audio(&audio),
+                Ok(None) => {}
+                Err(e) => self.message = Some(format!("Playing the original audio, cleanup failed: {e:#}")),
+            }
+        }
         if let Some(job) = &mut self.waveform_job
             && let Some(result) = job.poll()
         {

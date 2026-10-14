@@ -149,7 +149,7 @@ pub fn extract_audio_16k(path: &Path) -> Result<Vec<f32>> {
         .args(["-nostdin", "-v", "error", "-i"])
         .arg(path)
         .args(["-vn", "-ac", "1", "-ar", "16000"]);
-    if let Some(cleanup) = crate::audio::cleanup() {
+    if let Some(cleanup) = crate::audio::cleanup(path) {
         child.args(["-af", &cleanup]);
     }
     let mut child = child

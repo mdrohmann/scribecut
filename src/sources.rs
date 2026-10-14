@@ -98,7 +98,9 @@ fn key(path: &Path, extra: impl Hash) -> Result<String> {
     meta.len().hash(&mut h);
     meta.modified().ok().hash(&mut h);
     extra.hash(&mut h);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    // No dots: callers add an extension with `with_extension`, which would
+    // otherwise cut "deck.pptx-1234" back to "deck".
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file").replace('.', "_");
     Ok(format!("{stem}-{:016x}", h.finish()))
 }
 
@@ -170,4 +172,21 @@ fn video_frame(p: &Project, clip: &Path, at: f64) -> Result<PathBuf> {
         )?;
     }
     Ok(png)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cache_keys_survive_an_added_extension() {
+        let dir = std::env::temp_dir().join(format!("scribecut-sources-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Billing-Data.pptx.pdf");
+        std::fs::write(&file, b"x").unwrap();
+        let key = super::key(&file, 1).unwrap();
+        assert!(key.starts_with("Billing-Data_pptx-"), "{key}");
+        // pdftoppm writes `<key>.png`; the path we look for must be the same.
+        let png = dir.join(&key).with_extension("png");
+        assert_eq!(png, dir.join(format!("{key}.png")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
