@@ -114,7 +114,8 @@ impl App {
                 ui.add_enabled(has_camera, egui::Checkbox::new(&mut self.settings.record_camera, "Record camera"))
                     .on_hover_text("Records you as a second video track; choose per part of the video whether to show it")
                     .on_disabled_hover_text(format!("No camera at {}", self.settings.camera_device));
-                if platform::CAN_SET_POINTER_SIZE {
+                // Only sway can be told to enlarge the pointer; elsewhere the box would do nothing.
+                if platform::CAN_SET_POINTER_SIZE && platform::available() {
                     ui.checkbox(&mut self.settings.big_pointer, "Bigger pointer")
                         .on_hover_text("Doubles the mouse pointer size while recording");
                 }
@@ -146,7 +147,10 @@ impl App {
     }
 
     fn record_window(&mut self, ctx: &egui::Context) {
-        if platform::available() {
+        // Real window capture follows the window across desktops and past
+        // anything covering it, so it wins wherever the system offers it (sway
+        // >= 1.12, GNOME, KDE); otherwise list the windows and crop the screen.
+        if !self.system_windows && platform::available() {
             match platform::windows() {
                 Ok(windows) => self.screen = Screen::ChooseWindow { windows, filter: String::new() },
                 Err(e) => self.report(format!("Could not list windows: {e:#}")),
