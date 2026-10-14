@@ -218,7 +218,7 @@ fn load_toml(path: &Path) -> Result<Project> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut p = from_toml(&text, path.parent().unwrap_or(Path::new(".")))
         .with_context(|| format!("in {}", path.display()))?;
-    let transcript = p.media.with_extension("transcript.json");
+    let transcript = transcript_path(&p.media);
     if transcript.is_file() {
         let data = std::fs::read(&transcript)?;
         p.words = serde_json::from_slice(&data).with_context(|| format!("parsing {}", transcript.display()))?;
@@ -349,7 +349,14 @@ fn to_toml(p: &Project) -> Result<String> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // A temporary name of its own per write: two writers (a finished
+    // transcription and the UI, or two transcriptions of one file) must not
+    // share one, or a rename could move the other's half-written file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().context("no file name")?.to_owned();
+    name.push(format!(".{}-{n}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -362,8 +369,18 @@ pub fn save(p: &Project) -> Result<()> {
 
 /// Writes the words as JSON (for scribecut) and as readable timed lines (for people and agents).
 pub fn save_transcript(p: &Project) -> Result<()> {
-    write_atomic(&p.media.with_extension("transcript.json"), &serde_json::to_vec_pretty(&p.words)?)?;
-    write_atomic(&p.media.with_extension("transcript.txt"), transcript_text(&p.words).as_bytes())
+    write_transcript(&p.media, &p.words)
+}
+
+/// [`save_transcript`] for any video, with or without an edit file.
+pub fn write_transcript(media: &Path, words: &[Word]) -> Result<()> {
+    write_atomic(&transcript_path(media), &serde_json::to_vec_pretty(words)?)?;
+    write_atomic(&media.with_extension("transcript.txt"), transcript_text(words).as_bytes())
+}
+
+/// Where a video's word timings are kept.
+pub fn transcript_path(media: &Path) -> PathBuf {
+    media.with_extension("transcript.json")
 }
 
 /// One line per phrase (split at pauses over a second or every 15 words),
@@ -559,6 +576,24 @@ mod tests {
         let problems = validate(&p);
         assert!(problems.iter().any(|m| m.starts_with("slide 1:") && m.contains("not found")), "{problems:?}");
         assert!(problems.iter().any(|m| m.starts_with("cut 2:") && m.contains("after the video")), "{problems:?}");
+    }
+
+    #[test]
+    fn transcript_of_a_video_without_an_edit_file() {
+        let dir = std::env::temp_dir().join(format!("scribecut-transcript-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("export.mp4");
+        let words = vec![Word { text: "Hi".into(), start: 0.5, end: 0.9 }];
+        write_transcript(&video, &words).unwrap();
+        write_transcript(&video, &words).unwrap(); // replaces
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        // Both files, no temporaries left behind, and no edit file.
+        assert_eq!(names, ["export.transcript.json", "export.transcript.txt"]);
+        let back: Vec<Word> = serde_json::from_slice(&std::fs::read(transcript_path(&video)).unwrap()).unwrap();
+        assert_eq!(back.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

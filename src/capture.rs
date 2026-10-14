@@ -85,10 +85,48 @@ fn non_empty(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.len() > 1024)
 }
 
-/// A fresh, timestamped folder for a new recording.
-pub fn new_recording_dir() -> Result<PathBuf> {
+/// The name a new project gets unless the user picks one: the current time.
+pub fn default_project_name() -> String {
+    chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
+}
+
+/// A fresh folder for a new recording, named after the project. An existing
+/// folder of that name is never reused: " 2", " 3"… is appended instead.
+pub fn new_recording_dir(name: &str) -> Result<PathBuf> {
     let base = dirs::video_dir().or_else(dirs::home_dir).context("no home dir")?;
-    let dir = base.join("scribecut").join(chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string());
+    let dir = unused_dir(&base.join("scribecut"), name);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// `parent/<name>`, with the name made safe for a folder and numbered if taken.
+fn unused_dir(parent: &Path, name: &str) -> PathBuf {
+    let clean: String = name
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == ':' || c.is_control() { '-' } else { c })
+        .collect();
+    let clean = clean.trim_start_matches('.').trim();
+    let clean = if clean.is_empty() { default_project_name() } else { clean.to_owned() };
+    (1..)
+        .map(|n| parent.join(if n == 1 { clean.clone() } else { format!("{clean} {n}") }))
+        .find(|p| !p.exists())
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_folders_are_safe_and_never_reused() {
+        let parent = std::env::temp_dir().join(format!("scribecut-dirs-{}", std::process::id()));
+        std::fs::create_dir_all(parent.join("Billing demo")).unwrap();
+        assert_eq!(unused_dir(&parent, "  Billing demo "), parent.join("Billing demo 2"));
+        assert_eq!(unused_dir(&parent, "a/b: c"), parent.join("a-b- c"));
+        assert_eq!(unused_dir(&parent, "../up"), parent.join("-up"));
+        // Nothing usable left: falls back to a timestamp.
+        assert!(unused_dir(&parent, " .. ").file_name().unwrap().to_str().unwrap().starts_with("20"));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 }

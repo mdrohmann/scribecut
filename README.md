@@ -11,6 +11,8 @@ cargo run --release -- video.mkv          # open a video (or its .edit.toml) dir
 cargo run --release -- video.mkv --export out.mp4   # render the saved edits without a window
 cargo run --release -- video.mkv --script out.md    # write the edited transcript as a script
 cargo run --release -- video.mkv --check            # validate video.edit.toml (after editing it by hand)
+cargo run --release -- video.mkv --transcribe       # (re)write video.transcript.json/.txt, no window;
+                                                    # works on any video, e.g. an export, without an edit file
 ```
 
 On macOS, record through an app bundle instead — see [macOS](#macos) below.

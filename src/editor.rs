@@ -144,7 +144,8 @@ pub struct Editor {
     /// Modification time of the edit file as we last wrote or read it.
     edit_mtime: Option<SystemTime>,
     last_reload_check: Instant,
-    transcription: Option<Job<Vec<Word>>>,
+    /// The words, and why saving them failed if it did.
+    transcription: Option<Job<(Vec<Word>, Option<String>)>>,
     /// Loudness envelope (see `media::audio_peaks`), empty until loaded.
     waveform: Vec<f32>,
     /// Background-noise level in dB; the waveform is drawn from here up to 0 dB.
@@ -223,10 +224,20 @@ impl Editor {
     fn start_transcription(&mut self, ctx: &egui::Context) {
         let media = self.project.media.clone();
         self.transcription = Some(Job::spawn(ctx, "Transcribing", move |report| {
-            transcribe::transcribe(&media, move |s| match s {
+            let words = transcribe::transcribe(&media, move |s| match s {
                 transcribe::Status::Downloading(p) => report("Downloading model".into(), p),
                 transcribe::Status::Transcribing(p) => report("Transcribing".into(), p),
             })
+            .inspect_err(|e| eprintln!("scribecut: transcription failed: {e:#}"))?;
+            // Saved here, not when the UI picks the words up: a window that is
+            // hidden or on another workspace gets no frames, so that could be
+            // much later, or never if the app is closed first. Only the
+            // transcript files are written; the edit file stays the UI's.
+            let saved = crate::edit_file::write_transcript(&media, &words).map_err(|e| {
+                eprintln!("scribecut: saving the transcript failed: {e:#}");
+                format!("Saving the transcript failed: {e:#}")
+            });
+            Ok((words, saved.err()))
         }));
     }
 
@@ -326,7 +337,7 @@ impl Editor {
 
     fn export_script(&mut self) {
         let media = &self.project.media;
-        let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+        let stem = output_stem(media);
         let mut dialog = rfd::FileDialog::new()
             .set_file_name(format!("{stem}_script.md"))
             .add_filter("Markdown", &["md"]);
@@ -342,7 +353,7 @@ impl Editor {
 
     fn start_export(&mut self, ctx: &egui::Context) {
         let media = &self.project.media;
-        let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+        let stem = output_stem(media);
         let mut dialog = rfd::FileDialog::new()
             .set_file_name(format!("{stem}_edited.mp4"))
             .add_filter("MP4 video", &["mp4"]);
@@ -479,10 +490,10 @@ impl Editor {
         {
             self.transcription = None;
             match result {
-                Ok(words) => {
+                Ok((words, save_error)) => {
                     self.project.words = words;
-                    if let Err(e) = self.project.save_transcript() {
-                        self.message = Some(format!("Saving the transcript failed: {e:#}"));
+                    if save_error.is_some() {
+                        self.message = save_error;
                     }
                 }
                 Err(e) => self.message = Some(format!("Transcription failed: {e:#}")),
@@ -1458,6 +1469,17 @@ pub fn new_project(media: &Path, segment_starts: Vec<f64>) -> Result<Project> {
     })
 }
 
+/// Base name for exported files: the project folder's name for scribecut's
+/// own recordings (all called "recording.mkv"), else the video's own name.
+fn output_stem(media: &Path) -> String {
+    let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
+    let folder = media.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str());
+    match folder {
+        Some(folder) if stem == "recording" => folder.to_owned(),
+        _ => stem.to_owned(),
+    }
+}
+
 /// Draws an overlay the way ffmpeg's drawtext will: centred on (x, y), sized
 /// relative to the frame height, with a drop shadow. `at` overrides the position.
 fn paint_overlay(painter: &egui::Painter, frame: Rect, o: &Overlay, at: Option<Pos2>) {
@@ -1483,7 +1505,14 @@ pub fn fmt_time(t: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_time, noise_floor_db};
+    use super::{fmt_time, noise_floor_db, output_stem};
+    use std::path::Path;
+
+    #[test]
+    fn exports_are_named_after_the_project() {
+        assert_eq!(output_stem(Path::new("/v/scribecut/Billing demo/recording.mkv")), "Billing demo");
+        assert_eq!(output_stem(Path::new("/v/talk.mkv")), "talk");
+    }
 
     #[test]
     fn noise_floor_tracks_quiet_parts() {

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use egui::{Color32, RichText};
 
-use crate::capture::{Recorder, Source, connect, new_recording_dir};
+use crate::capture::{Recorder, Source, connect, default_project_name, new_recording_dir};
 use crate::settings::Settings;
 use crate::editor::{Action, Editor, new_project};
 use crate::geom::Output;
@@ -45,6 +45,8 @@ pub struct App {
     /// The system can share single windows itself (the portal on some desktops).
     system_windows: bool,
     settings: Settings,
+    /// Folder name for the next recording, asked for on the home screen.
+    project_name: String,
 }
 
 impl App {
@@ -55,6 +57,7 @@ impl App {
             error: None,
             system_windows: crate::capture::supports_system_windows(),
             settings: Settings::load(),
+            project_name: default_project_name(),
         };
         if let Some(path) = open {
             app.open(&path, &cc.egui_ctx);
@@ -81,6 +84,10 @@ impl App {
             ui.heading(RichText::new("scribecut").size(32.0));
             ui.label("Record your screen, then edit by transcript.");
             ui.add_space(24.0);
+            ui.label("Project name");
+            let name = ui.add_sized([240.0, 28.0], egui::TextEdit::singleline(&mut self.project_name));
+            name.on_hover_text("The recording's folder in Videos/scribecut");
+            ui.add_space(12.0);
             let big =
                 |text: &str| egui::Button::new(RichText::new(text).color(Color32::from_rgb(235, 90, 90)).size(18.0));
             if ui.add_sized([240.0, 40.0], big("Record full screen")).clicked() {
@@ -200,13 +207,14 @@ impl App {
         pick: impl FnOnce() -> Result<Option<Source>> + Send + 'static,
     ) -> Screen {
         let settings = self.settings.clone();
+        let name = self.project_name.clone();
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             // Recording starts here rather than on the UI thread: picking a window
             // on another workspace hides scribecut, and a hidden window gets no
             // UI updates until it is shown again.
-            let result = pick().and_then(|source| source.map(|s| start_recording(s, &settings)).transpose());
+            let result = pick().and_then(|source| source.map(|s| start_recording(s, &name, &settings)).transpose());
             let _ = tx.send(result);
             // `logic` picks the result up, even while the window is hidden.
             ctx.request_repaint();
@@ -479,6 +487,8 @@ impl eframe::App for App {
                         if let Err(e) = result {
                             self.error = Some(format!("{e:#}"));
                         }
+                        // The next recording is a new project.
+                        self.project_name = default_project_name();
                         let (tx, rx) = mpsc::channel();
                         let ctx = ctx.clone();
                         std::thread::spawn(move || {
@@ -520,8 +530,8 @@ impl eframe::App for App {
 }
 
 /// Connects to the screen stream and starts the first segment.
-fn start_recording(source: Source, settings: &Settings) -> Result<Recorder> {
-    let mut rec = Recorder::new(connect(source)?, new_recording_dir()?, settings)?;
+fn start_recording(source: Source, name: &str, settings: &Settings) -> Result<Recorder> {
+    let mut rec = Recorder::new(connect(source)?, new_recording_dir(name)?, settings)?;
     rec.start_segment()?;
     Ok(rec)
 }
