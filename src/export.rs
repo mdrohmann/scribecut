@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
@@ -30,7 +30,17 @@ fn fit(w: u32, h: u32) -> String {
 /// Builds the `-filter_complex` graph. Input 0 is the recording (camera = its
 /// 2nd video stream); input `i + 1` is slide `i`, a video clip if `clips[i]`.
 /// `text_files[i]` holds overlay i's text.
-pub fn filter_graph(p: &Project, clips: &[bool], text_files: &[PathBuf], font: Option<&Path>) -> String {
+/// `audio_cleanup` is an ffmpeg filter chain applied to the finished
+/// programme, after the kept ranges have been joined, so that leveling and
+/// loudness see exactly what the viewer will hear rather than each piece
+/// separately.
+pub fn filter_graph(
+    p: &Project,
+    clips: &[bool],
+    text_files: &[PathBuf],
+    font: Option<&Path>,
+    audio_cleanup: Option<&str>,
+) -> String {
     let mut g = String::new();
     let (w, h) = (p.width, p.height);
     // Everything below is composed on the source timeline, then trimmed.
@@ -114,7 +124,12 @@ pub fn filter_graph(p: &Project, clips: &[bool], text_files: &[PathBuf], font: O
         .collect();
     let _ = write!(g, "{inputs}concat=n={n}:v=1:a={}[outv]", u8::from(p.has_audio));
     if p.has_audio {
-        g.push_str("[outa]");
+        match audio_cleanup {
+            Some(cleanup) => {
+                let _ = write!(g, "[acat];[acat]{cleanup}[outa]");
+            }
+            None => g.push_str("[outa]"),
+        }
     }
     g
 }
@@ -143,9 +158,10 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
         .map(|(i, s)| sources::export_input(p, s).with_context(|| format!("slide {}", i + 1)))
         .collect::<Result<_>>()?;
     let clips: Vec<bool> = inputs.iter().map(|i| matches!(i, Input::Clip { .. })).collect();
-    let graph = filter_graph(p, &clips, &text_files, font.as_deref());
+    let cleanup = crate::audio::cleanup();
+    let graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref());
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = crate::media::ffmpeg();
     // -nostdin + null stdin: ffmpeg must not touch the terminal, or a
     // backgrounded scribecut gets stopped by SIGTTOU.
     cmd.stdin(Stdio::null())
@@ -199,7 +215,7 @@ mod tests {
 
     #[test]
     fn graph_without_edits_is_single_piece() {
-        let g = filter_graph(&project(), &[], &[], None);
+        let g = filter_graph(&project(), &[], &[], None, None);
         assert_eq!(
             g,
             "[0:v:0]null[vov];[vov]split=1[vs0];[0:a]asplit=1[as0];\
@@ -215,7 +231,7 @@ mod tests {
         p.has_audio = false;
         p.add_cut(Range::new(5.0, 8.0));
         p.overlays.push(Overlay { start: 1.0, end: 3.5, text: "hi".into(), x: 0.25, y: 0.75, size: 0.1, color: [255, 0, 16] });
-        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")));
+        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None);
         assert!(g.starts_with("[0:v:0]drawtext=fontfile='/f/a b.ttf':textfile='/t/o0.txt':"));
         assert!(g.contains("fontsize=72:fontcolor=0xff0010:"));
         assert!(g.contains("x=w*0.25000-text_w/2:y=h*0.75000-text_h/2:enable='between(t,1.000,3.500)'[vov]"));
@@ -233,7 +249,7 @@ mod tests {
         p.camera_size = Some((640, 480));
         p.set_camera(Range::new(13.0, 14.0), CameraMode::Full);
         p.set_camera(Range::new(15.0, 18.0), CameraMode::Pip);
-        let g = filter_graph(&p, &[false, true], &[], None);
+        let g = filter_graph(&p, &[false, true], &[], None, None);
         let fit = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
         assert!(g.starts_with(&format!(
             "[1:v]{fit},fps=30[s0];[0:v:0][s0]overlay=eof_action=pass:enable='between(t,2.000,4.000)'[b0];\
@@ -251,7 +267,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("scribecut-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ffmpeg = |args: &[&str]| {
-            assert!(Command::new("ffmpeg").args(["-nostdin", "-y", "-v", "error"]).args(args).status().unwrap().success())
+            assert!(crate::media::ffmpeg().args(["-nostdin", "-y", "-v", "error"]).args(args).status().unwrap().success())
         };
         let path = |name: &str| dir.join(name).display().to_string();
         // Screen (test pattern) + camera (solid green, 2nd video stream) + audio.
@@ -260,21 +276,37 @@ mod tests {
             "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-c:a", "libopus", &path("in.mkv")]);
         ffmpeg(&["-f", "lavfi", "-i", "color=c=0xff0000:size=800x600", "-frames:v", "1", &path("red.png")]);
         ffmpeg(&["-f", "lavfi", "-i", "color=c=0x0000ff:size=320x240:rate=30:duration=5", "-c:v", "libx264", &path("blue.mp4")]);
-        std::fs::write(dir.join("page.txt"), "Slide").unwrap();
-        assert!(Command::new("soffice")
-            .arg(format!("-env:UserInstallation=file://{}", path("lo-profile")))
-            .args(["--headless", "--convert-to", "pdf", "--outdir", &path(""), &path("page.txt")])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
-            .status
-            .success());
+        // A PDF slide needs LibreOffice to make one and poppler to rasterise
+        // it. Both are optional extras, so this covers them where they are
+        // installed and skips that one slide where they are not.
+        let have = |tool: &str| crate::media::tool(tool).is_absolute();
+        let pdf_slides = have("soffice") && have("pdfinfo") && have("pdftoppm");
+        if pdf_slides {
+            std::fs::write(dir.join("page.txt"), "Slide").unwrap();
+            assert!(Command::new(crate::media::tool("soffice"))
+                .arg(format!("-env:UserInstallation=file://{}", path("lo-profile")))
+                .args(["--headless", "--convert-to", "pdf", "--outdir", &path(""), &path("page.txt")])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+                .status
+                .success());
+        } else {
+            eprintln!("skipping the PDF slide: needs LibreOffice and poppler");
+        }
 
         let mut p = crate::editor::new_project(&dir.join("in.mkv"), vec![]).unwrap();
         assert!((p.duration - 20.0).abs() < 0.1);
         assert_eq!(p.camera_size, Some((320, 240)));
         let slide = |start, end, file: &str| Slide { start, end, file: file.into(), page: 1, clip_start: 0.0 };
-        p.slides = vec![slide(2.0, 4.0, "red.png"), slide(6.0, 8.0, "page.pdf"), slide(10.0, 12.0, "blue.mp4")];
+        p.slides = [
+            Some(slide(2.0, 4.0, "red.png")),
+            pdf_slides.then(|| slide(6.0, 8.0, "page.pdf")),
+            Some(slide(10.0, 12.0, "blue.mp4")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         p.set_camera(Range::new(13.0, 14.0), CameraMode::Full);
         p.set_camera(Range::new(15.0, 18.0), CameraMode::Pip);
         p.add_cut(Range::new(18.5, 19.5));
@@ -289,7 +321,7 @@ mod tests {
 
         // Average colour of a frame region (fractions of the frame).
         let color = |file: &Path, t: f64, (x0, y0, x1, y1): (f64, f64, f64, f64)| -> [u8; 3] {
-            let raw = Command::new("ffmpeg")
+            let raw = crate::media::ffmpeg()
                 .args(["-nostdin", "-v", "error", "-ss", &t.to_string(), "-i"])
                 .arg(file)
                 .args(["-frames:v", "1", "-vf", "scale=64:36", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
@@ -315,9 +347,11 @@ mod tests {
             assert_eq!(close(got, want), is, "{what} at {t}s: got {got:?}");
         };
         expect(3.0, middle, [255, 0, 0], true, "red image slide");
-        // A portrait page, letterboxed: white in the middle, black at the sides.
-        expect(7.0, (0.45, 0.02, 0.55, 0.1), [255, 255, 255], true, "PDF page");
-        expect(7.0, (0.0, 0.0, 0.1, 1.0), [0, 0, 0], true, "PDF letterbox");
+        if pdf_slides {
+            // A portrait page, letterboxed: white in the middle, black at the sides.
+            expect(7.0, (0.45, 0.02, 0.55, 0.1), [255, 255, 255], true, "PDF page");
+            expect(7.0, (0.0, 0.0, 0.1, 1.0), [0, 0, 0], true, "PDF letterbox");
+        }
         expect(11.0, middle, [0, 0, 255], true, "blue clip slide");
         expect(13.5, middle, [0, 255, 0], true, "camera full frame");
         expect(16.0, (0.82, 0.78, 0.96, 0.95), [0, 255, 0], true, "camera window bottom right");

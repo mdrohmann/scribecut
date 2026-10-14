@@ -1,15 +1,18 @@
 mod app;
+mod audio;
 mod capture;
 mod edit_file;
 mod editor;
 mod export;
+mod geom;
 mod media;
+mod platform;
 mod player;
 mod project;
+mod region;
 mod script;
 mod settings;
 mod sources;
-mod sway;
 mod transcribe;
 
 fn main() -> eframe::Result {

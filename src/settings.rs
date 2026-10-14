@@ -8,15 +8,18 @@ pub struct Settings {
     /// Record the camera as a second video track.
     pub record_camera: bool,
     pub camera_device: String,
-    /// Enlarge the mouse pointer while recording (sway only).
+    /// Enlarge the mouse pointer while recording. sway only: macOS has no way
+    /// to change the pointer size for the duration of a recording.
     pub big_pointer: bool,
     pub pointer_scale: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        let camera_device = "/dev/video0".to_string();
-        let record_camera = std::path::Path::new(&camera_device).exists();
+        // What names a camera differs by platform: a V4L2 device node on Linux,
+        // an AVFoundation device name on macOS, so the capture backend decides.
+        let camera_device = crate::capture::default_camera();
+        let record_camera = crate::capture::camera_available(&camera_device);
         Self { record_camera, camera_device, big_pointer: true, pointer_scale: 2.0 }
     }
 }
@@ -41,6 +44,6 @@ impl Settings {
     }
 
     pub fn camera_available(&self) -> bool {
-        std::path::Path::new(&self.camera_device).exists()
+        crate::capture::camera_available(&self.camera_device)
     }
 }

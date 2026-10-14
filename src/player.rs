@@ -200,3 +200,52 @@ pub fn preview_size(w: u32, h: u32, max_w: u32) -> (u32, u32) {
     let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
     (even(w as f64 * scale), even(h as f64 * scale))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_fits_within_the_width_and_stays_even() {
+        assert_eq!(preview_size(3584, 2240, 1280), (1280, 800));
+        // Never upscales.
+        assert_eq!(preview_size(640, 360, 1280), (640, 360));
+        // A missing size falls back rather than dividing by zero.
+        assert_eq!(preview_size(0, 0, 1280), (1280, 720));
+        let (w, h) = preview_size(1919, 1079, 1000);
+        assert_eq!((w % 2, h % 2), (0, 0), "4:2:0 needs even dimensions");
+    }
+
+    /// Decodes a real clip through playbin, which is what the editor's preview
+    /// is built on. Needs GStreamer's decoders and ffmpeg to make the clip, so
+    /// it runs with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn prerolls_a_frame_from_a_real_clip() {
+        gst::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("scribecut-player-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mkv");
+        let ok = crate::media::ffmpeg()
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=3"])
+            .args(["-c:v", "libx264"])
+            .arg(&clip)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "could not make a test clip");
+
+        let player = Player::new(&clip, (320, 180), egui::Context::default()).unwrap();
+        // `Player::new` waits for preroll, so a frame must already be waiting.
+        let latest = player.frame.lock().unwrap();
+        let frame = latest.as_ref().expect("playbin decoded no frame");
+        assert_eq!((frame.width, frame.height), (320, 180));
+        assert_eq!(frame.rgba.len(), 320 * 180 * 4);
+        // A test pattern is never a single flat colour.
+        let first = &frame.rgba[..4];
+        assert!(frame.rgba.chunks(4).any(|px| px != first), "frame is blank");
+
+        drop(latest);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

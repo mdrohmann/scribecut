@@ -111,7 +111,7 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 }
 
 fn pdf_pages(pdf: &Path) -> Result<u32> {
-    let out = Command::new("pdfinfo").arg(pdf).stdin(Stdio::null()).output().context("running pdfinfo")?;
+    let out = Command::new(crate::media::tool("pdfinfo")).arg(pdf).stdin(Stdio::null()).output().context("running pdfinfo")?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find_map(|l| l.strip_prefix("Pages:").and_then(|n| n.trim().parse().ok()))
@@ -123,7 +123,7 @@ fn pdf_page(p: &Project, pdf: &Path, page: u32, height: u32) -> Result<PathBuf> 
     let png = base.with_extension("png");
     if !png.is_file() {
         run(
-            Command::new("pdftoppm")
+            Command::new(crate::media::tool("pdftoppm"))
                 .args(["-png", "-singlefile", "-f", &page.to_string(), "-l", &page.to_string()])
                 .args(["-scale-to-x", "-1", "-scale-to-y", &height.to_string()])
                 .arg(pdf)
@@ -143,7 +143,7 @@ fn presentation_pdf(p: &Project, file: &Path) -> Result<PathBuf> {
         std::fs::create_dir_all(&out_dir)?;
         let profile = cache_dir(p)?.join("libreoffice-profile");
         run(
-            Command::new("soffice")
+            Command::new(crate::media::tool("soffice"))
                 .arg(format!("-env:UserInstallation=file://{}", profile.display()))
                 .args(["--headless", "--convert-to", "pdf", "--outdir"])
                 .arg(&out_dir)
@@ -161,7 +161,7 @@ fn video_frame(p: &Project, clip: &Path, at: f64) -> Result<PathBuf> {
     let png = cache_dir(p)?.join(key(clip, at.to_bits())?).with_extension("png");
     if !png.is_file() {
         run(
-            Command::new("ffmpeg")
+            crate::media::ffmpeg()
                 .args(["-nostdin", "-v", "error", "-y", "-ss", &format!("{at:.3}"), "-i"])
                 .arg(clip)
                 .args(["-frames:v", "1"])

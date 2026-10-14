@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
 chrono = "0.4.45"
 dirs = "7.0.0"
 eframe = "0.36.2"
@@ -17,10 +16,21 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "sync"] }
 toml = "1.1.8"
 ureq = "3.4.2"
 whisper-rs = "0.16.0"
+
+# The ScreenCast portal (PipeWire) is how Linux desktops hand out screen frames.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "screencast"] }
+tokio = { version = "1.53.2", features = ["rt", "rt-multi-thread", "sync"] }
+
+# macOS: CoreGraphics for the window/display list, AppKit to raise a window's app.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-graphics = "0.25.0"
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.1", default-features = false, features = ["std", "NSRunningApplication", "libc"] }
 
 [profile.dev.package."*"]
 opt-level = 3

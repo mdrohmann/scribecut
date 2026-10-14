@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace is worth more than a bare assertion line when a test fails on a
+  # machine we cannot poke at.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The point of this job: scribecut is developed on one platform at a time, so
+  # the other one's code only ever gets compiled here.
+  linux:
+    name: Linux (build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake clang \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev \
+            ffmpeg
+        # gstreamer{,-app,-video,-base}-1.0.pc come from the two gstreamer
+        # packages; the X11/Wayland set is what eframe's winit backend links
+        # against; cmake and clang build whisper.cpp. ffmpeg is a runtime
+        # dependency, installed so the audio filter probe sees a real build.
+
+      - name: Install Rust
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # whisper.cpp is a C++ build and by far the slowest part, so the key
+          # deliberately ignores source changes and only rolls on dependency
+          # changes.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        # Only the unit tests: the --ignored ones drive a real screen, a
+        # microphone and a 500 MB model download.
+        run: cargo test --locked
+
+  # macOS development happens on Intel, so this is also the only place the
+  # Apple Silicon build gets checked.
+  macos:
+    name: macOS (build + test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          brew update --quiet
+          # gstreamer's formula is the whole SDK, which carries the playback
+          # plugins scribecut needs. ffmpeg does the capturing and exporting.
+          brew install --quiet pkg-config cmake gstreamer ffmpeg
+
+      - name: Install Rust
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Test
+        # A hosted runner has no window server and no capture device, so the
+        # tests that ask CoreGraphics for the display and window lists, and the
+        # one that asks ffmpeg for a screen to record, cannot pass here. They
+        # are skipped by name so they still run on a real machine.
+        run: |
+          cargo test --locked -- \
+            --skip platform::macos::tests \
+            --skip capture::macos::tests::finds_a_real_screen_device
