@@ -1,0 +1,7 @@
+{"keep": [["^Okay, this is", "the whole team. Yeah,$", "intro, goals, demo"],
+          ["^We got early", "this comparison.$", "feedback, comparison", "'lots of numbers here' + first take of the feedback sentence"],
+          ["^And of course, it is", "being updated here.$", "first version", "first take of 'this is only the first version'"],
+          ["^next steps are to connect@4:35", "Thank you.$", "next steps, close", "'questions are welcome' (repeated at the end) + first two takes of the next steps"]],
+ "extra_cuts": [["^to the shared weekly view@0:39", "^to the shared weekly view@0:41", "repeated: 'to the shared weekly view'"]],
+ "slides": [{"from": 0, "to": "^So this is the view", "file": "slides.pdf", "page": 1},
+            {"from": "^next steps are to connect@4:35", "to": "end", "file": "slides.pdf", "page": 2}]}

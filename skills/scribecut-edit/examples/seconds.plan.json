@@ -1,0 +1,4 @@
+{"keep": [[0.5,6.4,"intro"],[32.9,62.7,"goal"],[62.7,82.3,"dashboard"],[148.8,187.4,"comparison"],[221.2,235.8,"cost"],[250.6,265.0,"prototype"],[281.4,288.7,"demo"],[290.1,305.8,"next steps"],[323.9,349.41,"close"]],
+ "notes": {"6.4-32.9": "repeated: first two takes of the goal"},
+ "extra_cuts": [[179.15,180.98,"repeated: 'that we'"],[182.10,187.40,"filler: 'um'"]],
+ "slides": [{"from":0,"to":62.7,"file":"slides.pdf","page":1},{"from":290.1,"to":"end","file":"slides.pdf","page":2}]}

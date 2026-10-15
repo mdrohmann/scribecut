@@ -205,6 +205,11 @@ All edit state is plain text next to the video, so you can change it in an edito
 Example instruction for an agent: *"In recording.transcript.txt find where I say 'battery decline tab';
 show slides/deck.pdf page 3 from there for 20 seconds, with me in the small window; then run --check."*
 
+A Claude Code skill for the whole job (cut retakes and pauses, add title and closing slides, stay
+under a length limit, export for Slack and check the cuts by re-transcribing the export) is in
+[`skills/scribecut-edit/`](skills/scribecut-edit/SKILL.md). To use it from the recordings folder,
+link it there: `ln -s ~/projects/scribecut/skills/scribecut-edit ~/Videos/scribecut/.claude/skills/`.
+
 Rendered PDF pages, converted presentations and video poster frames are cached in `.scribecut-cache/`.
 Projects from older versions (`<video>.scribecut.json`) are converted on open (the old file is kept as
 `.json.bak`).
