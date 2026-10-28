@@ -180,20 +180,24 @@ drops those stages instead of failing the export.
 | Overlay text | "+ Add overlay" (uses the selection as its time range) → text → "Place on video…" → click the spot |
 | Edit overlay | Click its green bar on the timeline, or "Edit" in the list |
 | Undo | `Ctrl+Z` (`Cmd+Z` on macOS) |
-| Zoom / pan timeline | Mouse wheel / Shift+wheel |
+| Zoom / pan timeline | Mouse wheel / Shift+wheel; `C` centres the view on the playhead without changing the zoom |
 | Slides | "+ Slide…" → pick an image, PDF, presentation (.pptx/.odp/.key, converted with LibreOffice) or video clip; it replaces the screen recording for the selection. Set the page (or the clip's start) in the dialog; click its purple bar to edit |
 | Camera | "Camera" menu → for the selection: Only me / Small window / Hide me; also the layout everywhere else and the small window's corner. Right-click an outlined range on the camera strip to remove it |
+| Re-record audio | Select a range → "Re-record audio…". The edited video of the selection (cuts skipped, slides, camera and text shown) plays without sound after a 3-second countdown while you speak; recording stops by itself at the end (or "Stop early"). What is said there now is shown to read from. The take replaces the recording's sound in that range, its words replace the transcript's, and it is saved as `voiceovers/take-N.flac`. A purple band on the waveform marks it; remove it in the "Re-recorded audio" list. Cuts made inside the range afterwards remove narration and picture together, so you can trim pauses and slips from a take; restoring a cut it was recorded around leaves that part without narration (marked in red) |
 | Export | "Export…" → MP4 (H.264/AAC) |
 | Script | "Export script…" → Markdown of the transcript after cuts: paragraphs at pauses with their time in the edited video, `---` between recorded pieces, `[On screen: …]` notes for overlays. Handy as a script for re-recording |
 
-Playback skips cuts and shows slides, camera and overlays, so the preview matches the export
+Playback skips cuts and shows slides, camera and overlays, so the preview matches the export. The
+sound plays straight through with the cuts already removed and the picture follows it, so a cut
+never interrupts the sound
 (layering: screen < slide < camera < text).
 
 ## Editing with text files (or an agent)
 
 All edit state is plain text next to the video, so you can change it in an editor or have an agent do it:
 
-- `<video>.edit.toml` – cuts (with optional notes), slides, camera layout and overlays. Its header
+- `<video>.edit.toml` – cuts (with optional notes), slides, camera layout, overlays and re-recorded
+  audio (`[[voiceover]]`, made in the app; its words are in `voiceovers/take-N.transcript.json`). Its header
   explains the format. Times are `"m:ss.s"` strings on the original recording's timeline, so cuts never
   shift other times. scribecut reloads the file within a second when it changes on disk; mistakes are
   reported in the app and the previous state is kept.
@@ -245,4 +249,5 @@ when you use `cargo test`, which is separate from the app bundle's own permissio
 | `media` | ffmpeg/ffprobe wrappers, audio peaks, tool lookup |
 | `export` | Rendering the edit with ffmpeg |
 | `transcribe` | whisper.cpp with word timestamps |
-| `project` | The saved edit (`.scribecut.json`) |
+| `project` | The edit model (saved by `edit_file` as `.edit.toml`) |
+| `voiceover` | Re-recorded narration: the microphone take and splicing takes into the sound |

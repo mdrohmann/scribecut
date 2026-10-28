@@ -14,6 +14,7 @@ mod script;
 mod settings;
 mod sources;
 mod transcribe;
+mod voiceover;
 
 fn main() -> eframe::Result {
     gst::init().expect("failed to initialise GStreamer");
@@ -59,8 +60,8 @@ fn main() -> eframe::Result {
                     println!("{problem}");
                 }
                 if problems.is_empty() {
-                    println!("OK: {} cuts, {} slides, {} camera ranges, {} overlays; {} after cuts",
-                        p.cuts.len(), p.slides.len(), p.camera_ranges.len(), p.overlays.len(),
+                    println!("OK: {} cuts, {} slides, {} camera ranges, {} overlays, {} voiceovers; {} after cuts",
+                        p.cuts.len(), p.slides.len(), p.camera_ranges.len(), p.overlays.len(), p.voiceovers.len(),
                         editor::fmt_time(p.output_duration()));
                 } else {
                     std::process::exit(1);
@@ -104,7 +105,8 @@ fn headless_transcribe(input: &std::path::Path) -> anyhow::Result<()> {
         Some("toml" | "json") => load_project(input)?.media,
         _ => input.to_path_buf(),
     };
-    if !media::probe(&media)?.has_audio {
+    // Audio-only files (a re-recorded take) don't probe as videos; just try them.
+    if media::probe(&media).is_ok_and(|info| !info.has_audio) {
         anyhow::bail!("{} has no audio track", media.display());
     }
     let out = edit_file::transcript_path(&media);

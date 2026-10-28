@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::editor::fmt_time;
 use crate::project::{
-    CameraMode, CameraRange, CameraSettings, Corner, Cut, Overlay, Project, Range, Slide, Word,
+    CameraMode, CameraRange, CameraSettings, Corner, Cut, Overlay, Project, Range, Slide, Voiceover, Word,
 };
 
 const HEADER: &str = r##"# scribecut edit file. Safe to edit by hand or by an agent while scribecut is
@@ -32,6 +32,12 @@ const HEADER: &str = r##"# scribecut edit file. Safe to edit by hand or by an ag
 # [[camera_range]]  from, to, mode = "full" (only me) | "pip" (small window) | "off"
 # [[overlay]]       from, to, text, x, y (0..1, centre of the text), size (fraction of
 #                   the frame height), color ("#rrggbb")
+# [[voiceover]]     from, to, file, kept - narration recorded again in scribecut,
+#                   heard instead of the recording's own sound. It was spoken over the
+#                   edited video: the file holds the kept ranges listed in kept, back to
+#                   back. Cuts added inside from..to later remove narration and picture
+#                   together; a part of from..to outside kept has no narration.
+#                   Its words are in <file>.transcript.json/.txt, on the file's timeline.
 # Layering: screen recording < slide < camera < overlay text.
 
 "##;
@@ -89,6 +95,8 @@ struct EditFile {
     camera_ranges: Vec<CameraRangeDto>,
     #[serde(default, rename = "overlay", skip_serializing_if = "Vec::is_empty")]
     overlays: Vec<OverlayDto>,
+    #[serde(default, rename = "voiceover", skip_serializing_if = "Vec::is_empty")]
+    voiceovers: Vec<VoiceoverDto>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -181,6 +189,18 @@ struct OverlayDto {
     color: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct VoiceoverDto {
+    from: Time,
+    to: Time,
+    file: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kept: Vec<[Time; 2]>,
+    /// Older files: seconds recorded over, instead of `kept`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    length: Option<f64>,
+}
+
 fn color_hex([r, g, b]: [u8; 3]) -> String {
     format!("#{r:02x}{g:02x}{b:02x}")
 }
@@ -215,6 +235,9 @@ pub fn load(path: &Path) -> Result<Project> {
 }
 
 fn load_toml(path: &Path) -> Result<Project> {
+    // Absolute, so a file named relative to the current folder still gives
+    // an absolute media path (playback needs one).
+    let path = &std::path::absolute(path)?;
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut p = from_toml(&text, path.parent().unwrap_or(Path::new(".")))
         .with_context(|| format!("in {}", path.display()))?;
@@ -222,6 +245,13 @@ fn load_toml(path: &Path) -> Result<Project> {
     if transcript.is_file() {
         let data = std::fs::read(&transcript)?;
         p.words = serde_json::from_slice(&data).with_context(|| format!("parsing {}", transcript.display()))?;
+    }
+    for v in &mut p.voiceovers {
+        let transcript = transcript_path(&p.media.parent().unwrap_or(Path::new(".")).join(&v.file));
+        if transcript.is_file() {
+            let data = std::fs::read(&transcript)?;
+            v.words = serde_json::from_slice(&data).with_context(|| format!("parsing {}", transcript.display()))?;
+        }
     }
     Ok(p)
 }
@@ -289,11 +319,28 @@ fn from_toml(text: &str, dir: &Path) -> Result<Project> {
             .collect(),
         camera,
         camera_ranges,
+        voiceovers: Vec::new(),
     };
     // Through add_cut so overlapping cuts written by hand are merged.
     for c in cuts {
         p.add_cut_with_note(Range { start: c.start, end: c.end }, c.note);
     }
+    for v in f.voiceovers {
+        let (start, end) = range(v.from, v.to);
+        let mut take = Voiceover { start, end, file: v.file, pieces: Vec::new(), stale_length: None, words: Vec::new() };
+        if v.kept.is_empty() {
+            // Older files: assume the cuts it was recorded with are the ones
+            // now, unless the length says otherwise.
+            let now = p.kept_pieces(Range { start, end });
+            take.pieces = now.iter().map(|(r, _)| *r).collect();
+            let kept: f64 = take.pieces.iter().map(Range::len).sum();
+            take.stale_length = v.length.filter(|l| (l - kept).abs() > 0.05);
+        } else {
+            take.pieces = v.kept.iter().map(|[a, b]| Range::new(a.0, b.0)).collect();
+        }
+        p.voiceovers.push(take);
+    }
+    p.voiceovers.sort_by(|a, b| a.start.total_cmp(&b.start));
     Ok(p)
 }
 
@@ -342,6 +389,21 @@ fn to_toml(p: &Project) -> Result<String> {
                 y: o.y,
                 size: o.size,
                 color: color_hex(o.color),
+            })
+            .collect(),
+        voiceovers: p
+            .voiceovers
+            .iter()
+            .map(|v| VoiceoverDto {
+                from: Time(v.start),
+                to: Time(v.end),
+                file: v.file.clone(),
+                kept: if v.stale_length.is_some() {
+                    Vec::new()
+                } else {
+                    v.pieces.iter().map(|r| [Time(r.start), Time(r.end)]).collect()
+                },
+                length: v.stale_length,
             })
             .collect(),
     };
@@ -473,9 +535,23 @@ pub fn validate(p: &Project) -> Vec<String> {
     for (i, s) in p.slides.iter().enumerate() {
         check_range(format!("slide {}", i + 1), s.start, s.end);
     }
+    for (i, v) in p.voiceovers.iter().enumerate() {
+        check_range(format!("voiceover {}", i + 1), v.start, v.end);
+    }
     for (i, s) in p.slides.iter().enumerate() {
         if let Err(e) = crate::sources::check(p, s) {
             problems.push(format!("slide {}: {e:#}", i + 1));
+        }
+    }
+    for (i, v) in p.voiceovers.iter().enumerate() {
+        if !p.resolve(&v.file).is_file() {
+            problems.push(format!("voiceover {}: file {} not found", i + 1, v.file.display()));
+        }
+        if let Some(problem) = p.voiceover_problem(v) {
+            problems.push(format!("voiceover {}: {problem}", i + 1));
+        }
+        if p.voiceovers[..i].iter().any(|o| o.end > v.start && o.start < v.end) {
+            problems.push(format!("voiceover {}: overlaps an earlier voiceover", i + 1));
         }
     }
     if p.camera_size.is_none() && (!p.camera_ranges.is_empty() || p.camera.default != CameraMode::Off) {
@@ -519,6 +595,14 @@ mod tests {
             slides: vec![Slide { start: 20.0, end: 30.0, file: "slides/deck.pdf".into(), page: 3, clip_start: 0.0 }],
             camera: CameraSettings { default: CameraMode::Pip, ..Default::default() },
             camera_ranges: vec![CameraRange { start: 20.0, end: 25.0, mode: CameraMode::Full }],
+            voiceovers: vec![Voiceover {
+                start: 40.0,
+                end: 50.5,
+                file: "voiceovers/take-1.flac".into(),
+                pieces: vec![Range { start: 40.0, end: 50.5 }],
+                stale_length: None,
+                words: vec![],
+            }],
         }
     }
 
@@ -573,9 +657,33 @@ mod tests {
         let mut p = sample();
         p.slides[0].file = "missing.png".into();
         p.cuts.push(Cut { start: 110.0, end: 130.0, note: String::new() });
+        p.voiceovers[0].pieces = vec![Range { start: 40.0, end: 45.0 }, Range { start: 46.0, end: 50.5 }];
         let problems = validate(&p);
+        assert!(problems.iter().any(|m| m.starts_with("voiceover 1: file") && m.contains("not found")), "{problems:?}");
+        assert!(problems.iter().any(|m| m.starts_with("voiceover 1: 1.0s inside it has no narration")), "{problems:?}");
         assert!(problems.iter().any(|m| m.starts_with("slide 1:") && m.contains("not found")), "{problems:?}");
         assert!(problems.iter().any(|m| m.starts_with("cut 2:") && m.contains("after the video")), "{problems:?}");
+    }
+
+    #[test]
+    fn older_voiceovers_without_kept_ranges() {
+        let text = |length: &str| {
+            format!(
+                "[source]\nmedia = \"v.mkv\"\nduration = 60\nsize = [640, 360]\nfps = 30\nhas_audio = true\n\n\
+                 [[cut]]\nfrom = 10\nto = 12\n\n\
+                 [[voiceover]]\nfrom = 5\nto = 20\nfile = \"t.flac\"\nlength = {length}\n"
+            )
+        };
+        // Still matching the cuts: the pieces are the kept parts, written out from then on.
+        let p = from_toml(&text("13.0"), Path::new("/d")).unwrap();
+        assert_eq!(p.voiceovers[0].pieces, vec![Range { start: 5.0, end: 10.0 }, Range { start: 12.0, end: 20.0 }]);
+        assert_eq!(p.voiceover_problem(&p.voiceovers[0]), None);
+        assert!(to_toml(&p).unwrap().contains("kept = [["));
+        // Not matching: reported, and kept as it was.
+        let p = from_toml(&text("15.0"), Path::new("/d")).unwrap();
+        assert!(p.voiceover_problem(&p.voiceovers[0]).unwrap().contains("record it again"));
+        let back = to_toml(&p).unwrap();
+        assert!(back.contains("length = 15.0") && !back.contains("kept ="), "{back}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The editing screen: video preview, word-linked transcript, timeline with
-//! cuts, and text overlays.
+//! cuts, text overlays, slides, camera layout and re-recorded narration.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,9 @@ use anyhow::{Context as _, Result};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::player::{Player, preview_size};
-use crate::project::{CameraMode, Corner, Overlay, Project, Range, Slide, Word};
+use crate::project::{CameraMode, Corner, Overlay, Project, Range, Slide, Voiceover, Word, word_at};
 use crate::transcribe;
+use crate::voiceover::Microphone;
 
 pub const OVERLAY_FONT: &str = "overlay";
 
@@ -25,6 +26,11 @@ const WAVE: Color32 = Color32::from_rgb(70, 170, 200);
 const SLIDE_BAR: Color32 = Color32::from_rgb(120, 80, 170);
 const CAMERA_FULL: Color32 = Color32::from_rgb(220, 120, 40);
 const CAMERA_PIP: Color32 = Color32::from_rgb(170, 110, 60);
+const VOICEOVER: Color32 = Color32::from_rgba_premultiplied(120, 60, 140, 70);
+const WARNING: Color32 = Color32::from_rgb(230, 90, 90);
+
+/// Seconds counted down before a re-recording starts.
+const COUNTDOWN: f64 = 3.0;
 
 /// A background task reporting progress and a final result.
 struct Job<T> {
@@ -111,6 +117,42 @@ fn fit_rect(outer: Rect, aspect: f32) -> Rect {
     Rect::from_center_size(outer.center(), size)
 }
 
+/// Recording the narration for a range again, over the edited video.
+struct Dub {
+    range: Range,
+    /// Seconds of the range left after the cuts: how long the take runs.
+    length: f64,
+    /// What is said there now, to read from.
+    script: String,
+    /// The edited picture of the range, playing while the take is recorded.
+    texture: Option<egui::TextureHandle>,
+    stage: DubStage,
+}
+
+enum DubStage {
+    /// Rendering the edited picture of the range.
+    Preparing(Job<PathBuf>),
+    /// Showing its first frame, waiting for Start.
+    Ready(Player),
+    /// The microphone is already running, so that it has settled by the time
+    /// the take starts.
+    Countdown { clip: Player, mic: Microphone, go: Instant },
+    /// `offset`: seconds into the microphone file where the picture started.
+    Recording { clip: Player, mic: Microphone, offset: f64 },
+    /// Cutting the take out of the microphone file and transcribing it.
+    Saving(Job<Voiceover>),
+    Failed(String),
+}
+
+impl Dub {
+    fn clip(&mut self) -> Option<&mut Player> {
+        match &mut self.stage {
+            DubStage::Ready(clip) | DubStage::Countdown { clip, .. } | DubStage::Recording { clip, .. } => Some(clip),
+            _ => None,
+        }
+    }
+}
+
 /// An overlay being created or edited in the dialog.
 struct Draft {
     index: Option<usize>,
@@ -123,6 +165,24 @@ pub enum Action {
 
 pub struct Editor {
     pub project: Project,
+    /// The words as heard: the recording's, with re-recorded ranges replaced.
+    words: Vec<Word>,
+    /// Re-recording in progress.
+    dub: Option<Dub>,
+    /// How the takes are spliced in, as of the last audio render.
+    audio_key: Option<String>,
+    /// The sound on the source timeline (cleaned up, takes spliced in), or
+    /// the recording itself, once known.
+    programme: Option<PathBuf>,
+    /// The kept ranges `sound` was rendered for.
+    sound_cuts: Vec<Range>,
+    /// The sound as the export will have it, cuts removed. Once there it
+    /// drives playback: it plays straight through, and the picture follows
+    /// it, jumping over cuts, so the sound is never interrupted at a cut.
+    sound: Option<Player>,
+    sound_job: Option<Job<PathBuf>>,
+    /// When the picture was last moved to follow the sound.
+    last_follow: Instant,
     player: Player,
     texture: Option<egui::TextureHandle>,
     pos: f64,
@@ -181,6 +241,14 @@ impl Editor {
             None => None,
         };
         let mut editor = Self {
+            words: project.heard_words(),
+            dub: None,
+            audio_key: crate::voiceover::splice(&project, "", 0, ""),
+            programme: None,
+            sound_cuts: Vec::new(),
+            sound: None,
+            sound_job: None,
+            last_follow: Instant::now(),
             project,
             player,
             texture: None,
@@ -211,8 +279,7 @@ impl Editor {
         if editor.project.has_audio {
             let media = editor.project.media.clone();
             editor.waveform_job = Some(Job::spawn(ctx, "Waveform", move |_| crate::media::audio_peaks(&media)));
-            let media = editor.project.media.clone();
-            editor.clean_audio_job = Some(Job::spawn(ctx, "Cleaning audio", move |_| crate::audio::render_clean(&media)));
+            editor.render_audio();
             if editor.project.words.is_empty() {
                 editor.start_transcription(ctx);
             }
@@ -239,6 +306,124 @@ impl Editor {
             });
             Ok((words, saved.err()))
         }));
+    }
+
+    /// Renders the narration for playback (cleaned up, takes spliced in);
+    /// playback switches over to it when done.
+    fn render_audio(&mut self) {
+        let project = self.snapshot();
+        self.clean_audio_job = Some(Job::spawn(&self.ctx, "Preparing audio", move |_| crate::audio::render_clean(&project)));
+    }
+
+    /// After any change to the edits: the heard words, and the playback
+    /// audio if the takes or the cuts inside them changed.
+    fn refresh(&mut self) {
+        self.words = self.project.heard_words();
+        let key = crate::voiceover::splice(&self.project, "", 0, "");
+        if key != self.audio_key {
+            self.audio_key = key;
+            if self.project.has_audio {
+                self.render_audio();
+            }
+        } else if self.project.kept_ranges() != self.sound_cuts {
+            self.render_sound();
+        }
+    }
+
+    /// Renders the sound with the current cuts removed, from `programme`.
+    fn render_sound(&mut self) {
+        let Some(programme) = self.programme.clone() else { return };
+        let kept = self.project.kept_ranges();
+        self.sound_cuts = kept.clone();
+        let media = self.project.media.clone();
+        self.sound_job =
+            Some(Job::spawn(&self.ctx, "Preparing audio", move |_| crate::audio::render_cut(&media, &programme, &kept)));
+    }
+
+    /// Plays `file` (the sound with the cuts removed) from now on, with a
+    /// silent picture following it.
+    fn use_sound(&mut self, file: &Path) {
+        let playing = self.player.playing;
+        let mut sound = match Player::new(file, (16, 16), self.ctx.clone()) {
+            Ok(sound) => sound,
+            Err(e) => {
+                self.message = Some(format!("Playing the audio: {e:#}"));
+                return;
+            }
+        };
+        if self.sound.is_none() {
+            let preview = preview_size(self.project.width, self.project.height, 1600);
+            match Player::silent(&self.project.media, preview, self.ctx.clone()) {
+                Ok(mut player) => {
+                    player.seek(self.pos);
+                    self.player = player;
+                }
+                Err(e) => {
+                    self.message = Some(format!("Playing the video: {e:#}"));
+                    return;
+                }
+            }
+        }
+        sound.seek(self.project.output_time(self.pos));
+        self.sound = Some(sound);
+        if playing {
+            self.play();
+        }
+    }
+
+    fn play(&mut self) {
+        if let Some(sound) = &mut self.sound {
+            if self.project.cut_at(self.pos).is_some() {
+                // Start where the export continues.
+                self.pos = self.project.source_time(self.project.output_time(self.pos));
+                self.player.seek(self.pos);
+            }
+            sound.seek(self.project.output_time(self.pos));
+            sound.play();
+        }
+        self.player.play();
+    }
+
+    fn pause(&mut self) {
+        self.player.pause();
+        if let Some(sound) = &mut self.sound {
+            sound.pause();
+        }
+    }
+
+    fn toggle_play(&mut self) {
+        if self.player.playing { self.pause() } else { self.play() }
+    }
+
+    /// Where playback is: from the sound while it drives playback (moving
+    /// the picture over cuts as the sound passes them), else from the picture.
+    fn follow_sound(&mut self) {
+        let Some(sound) = &mut self.sound else {
+            self.pos = self.player.position();
+            self.skip_cuts();
+            return;
+        };
+        if let Some(err) = sound.poll() {
+            self.message = Some(format!("Playback error: {err}"));
+        }
+        if !self.player.playing {
+            self.pos = self.player.position();
+            return;
+        }
+        if !sound.playing {
+            // The end.
+            self.player.pause();
+            self.pos = self.player.position();
+            return;
+        }
+        let t = self.project.source_time(sound.position());
+        let shown = self.player.position();
+        let off = (shown - t).abs() > 0.3 && self.last_follow.elapsed() > Duration::from_millis(500);
+        if off || (self.project.cut_at(shown).is_some() && self.last_follow.elapsed() > Duration::from_millis(150)) {
+            self.player.seek(t);
+            self.last_follow = Instant::now();
+        }
+        self.pos = t;
     }
 
     fn edit_path(&self) -> PathBuf {
@@ -272,6 +457,7 @@ impl Editor {
                 self.draft = None;
                 self.slide_draft = None;
                 self.placing = false;
+                self.refresh();
                 self.message = Some(format!("{} changed - reloaded", path.file_name().unwrap_or_default().to_string_lossy()));
             }
             Err(e) => self.message = Some(format!("Not reloaded, {e:#}")),
@@ -288,6 +474,7 @@ impl Editor {
         self.undo.push(self.snapshot());
         f(&mut self.project);
         self.save();
+        self.refresh();
     }
 
     fn undo(&mut self) {
@@ -298,12 +485,16 @@ impl Editor {
             self.slide_draft = None;
             self.placing = false;
             self.save();
+            self.refresh();
         }
     }
 
     fn seek(&mut self, t: f64) {
         let t = t.clamp(0.0, self.project.duration);
         self.player.seek(t);
+        if let Some(sound) = &mut self.sound {
+            sound.seek(self.project.output_time(t));
+        }
         if let Some(cam) = &mut self.camera {
             cam.seek(t);
         }
@@ -375,8 +566,7 @@ impl Editor {
         if let Some(err) = self.player.poll() {
             self.message = Some(format!("Playback error: {err}"));
         }
-        self.pos = self.player.position();
-        self.skip_cuts();
+        self.follow_sound();
         self.sync_camera();
         if self.player.playing {
             self.follow_playhead();
@@ -387,6 +577,7 @@ impl Editor {
         }
         self.upload_frame(&ctx);
         self.upload_camera_frame(&ctx);
+        self.update_dub(&ctx);
         self.keyboard(&ctx);
 
         let mut action = None;
@@ -404,23 +595,220 @@ impl Editor {
         egui::CentralPanel::default().show(ui, |ui| self.video(ui));
         self.overlay_dialog(&ctx);
         self.slide_dialog(&ctx);
+        self.dub_dialog(&ctx);
         action
     }
 
-    /// Swaps playback over to the cleaned-up narration, where it was.
-    fn play_with_audio(&mut self, audio: &Path) {
-        let preview = preview_size(self.project.width, self.project.height, 1600);
-        let ctx = self.ctx.clone();
-        match Player::with_audio(&self.project.media, audio, preview, ctx) {
-            Ok(mut player) => {
-                let (pos, playing) = (self.pos, self.player.playing);
-                player.seek(pos);
-                if playing {
-                    player.play();
+    // ------------------------------------------------------- re-recording
+
+    /// Starts re-recording the narration for the selection: first renders the
+    /// edited picture of it to speak over.
+    fn open_dub(&mut self) {
+        let Some(range) = self.selection else { return };
+        // To the hundredth, as the edit file stores it, so the take lines up
+        // the same way after the project is opened again.
+        let round = |t: f64| (t * 100.0).round() / 100.0;
+        let range = Range::new(round(range.start), round(range.end));
+        let length = self.project.kept_length(range);
+        if length < 0.5 {
+            self.message = Some("Select at least half a second that isn't cut to re-record".into());
+            return;
+        }
+        self.pause();
+        let script = self
+            .words
+            .iter()
+            .filter(|w| {
+                let mid = (w.start + w.end) / 2.0;
+                range.start <= mid && mid < range.end && self.project.cut_at(mid).is_none()
+            })
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let project = self.snapshot();
+        let width = preview_size(project.width, project.height, 960).0;
+        let out = project.base_dir().join(".scribecut-cache").join("voiceover-picture.mp4");
+        let job = Job::spawn(&self.ctx, "Preparing the video", move |report| {
+            std::fs::create_dir_all(out.parent().unwrap())?;
+            crate::export::preview_clip(&project, range, width, &out, |p| report("Preparing the video".into(), p))?;
+            Ok(out)
+        });
+        self.dub = Some(Dub { range, length, script, texture: None, stage: DubStage::Preparing(job) });
+    }
+
+    /// Moves a re-recording along: picture ready, countdown over, take ended.
+    fn update_dub(&mut self, ctx: &egui::Context) {
+        let Some(dub) = &mut self.dub else { return };
+        let preview = preview_size(self.project.width, self.project.height, 960);
+        let stage = std::mem::replace(&mut dub.stage, DubStage::Failed(String::new()));
+        let mut saved = None;
+        dub.stage = match stage {
+            DubStage::Preparing(mut job) => match job.poll() {
+                None => DubStage::Preparing(job),
+                Some(Ok(clip)) => match Player::new(&clip, preview, ctx.clone()) {
+                    Ok(player) => DubStage::Ready(player),
+                    Err(e) => DubStage::Failed(format!("Playing the video: {e:#}")),
+                },
+                Some(Err(e)) => DubStage::Failed(format!("Preparing the video failed: {e:#}")),
+            },
+            DubStage::Countdown { mut clip, mic, go } => {
+                ctx.request_repaint();
+                if let Some(e) = mic.error() {
+                    DubStage::Failed(e)
+                } else if Instant::now() >= go {
+                    let offset = mic.position();
+                    clip.play();
+                    DubStage::Recording { clip, mic, offset }
+                } else {
+                    DubStage::Countdown { clip, mic, go }
                 }
-                self.player = player;
             }
-            Err(e) => self.message = Some(format!("Playing the original audio: {e:#}")),
+            DubStage::Recording { mut clip, mic, offset } => {
+                ctx.request_repaint();
+                let _ = clip.poll();
+                if let Some(e) = mic.error() {
+                    DubStage::Failed(e)
+                } else if !clip.playing {
+                    // The picture reached its end.
+                    Self::save_take(&self.project, dub.range, dub.length, mic, offset, ctx)
+                } else {
+                    DubStage::Recording { clip, mic, offset }
+                }
+            }
+            DubStage::Saving(mut job) => match job.poll() {
+                None => DubStage::Saving(job),
+                Some(Ok(take)) => {
+                    saved = Some(take);
+                    DubStage::Failed(String::new())
+                }
+                Some(Err(e)) => DubStage::Failed(format!("Saving the take failed: {e:#}")),
+            },
+            other => other,
+        };
+        if let Some(take) = saved {
+            self.message = Some(format!(
+                "Re-recorded {} – {} ({} words)",
+                fmt_time(take.start),
+                fmt_time(take.end),
+                take.words.len()
+            ));
+            self.dub = None;
+            self.edit(|p| p.add_voiceover(take));
+            return;
+        }
+        if let Some(frame) = dub.clip().and_then(|c| c.frame.lock().unwrap().take()) {
+            let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+            match &mut dub.texture {
+                Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+                None => dub.texture = Some(ctx.load_texture("dub", image, egui::TextureOptions::LINEAR)),
+            }
+        }
+    }
+
+    /// Ends the take: cuts it out of the microphone file and transcribes it.
+    fn save_take(p: &Project, range: Range, length: f64, mic: Microphone, offset: f64, ctx: &egui::Context) -> DubStage {
+        let recorded = (mic.position() - offset).clamp(0.0, length);
+        let raw = mic.stop();
+        let out = match crate::voiceover::new_take_path(p) {
+            Ok(out) => out,
+            Err(e) => return DubStage::Failed(format!("{e:#}")),
+        };
+        let file = out.strip_prefix(p.base_dir()).map(Path::to_path_buf).unwrap_or_else(|_| out.clone());
+        let pieces: Vec<Range> = p.kept_pieces(range).into_iter().map(|(r, _)| r).collect();
+        DubStage::Saving(Job::spawn(ctx, "Saving the take", move |report| {
+            crate::voiceover::save_take(&raw, offset, recorded, &out)?;
+            let _ = std::fs::remove_file(&raw);
+            report("Transcribing the take".into(), 0.0);
+            let words = transcribe::transcribe(&out, move |s| {
+                if let transcribe::Status::Transcribing(f) = s {
+                    report("Transcribing the take".into(), f);
+                }
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("scribecut: transcribing the take failed: {e:#}");
+                Vec::new()
+            });
+            crate::edit_file::write_transcript(&out, &words)?;
+            Ok(Voiceover { start: range.start, end: range.end, file, pieces, stale_length: None, words })
+        }))
+    }
+
+    fn dub_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dub) = &mut self.dub else { return };
+        let (mut open, mut start, mut stop) = (true, false, false);
+        let replaces: Vec<String> = self
+            .project
+            .voiceovers
+            .iter()
+            .filter(|v| v.start < dub.range.end && v.end > dub.range.start)
+            .map(|v| format!("{} – {}", fmt_time(v.start), fmt_time(v.end)))
+            .collect();
+        egui::Window::new("Re-record audio")
+            .open(&mut open)
+            .resizable(false)
+            .default_pos(ctx.content_rect().right_top() + vec2(-460.0, 60.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(format!(
+                    "{} – {}: {:.1} s after cuts",
+                    fmt_time(dub.range.start),
+                    fmt_time(dub.range.end),
+                    dub.length
+                ));
+                if !replaces.is_empty() {
+                    ui.colored_label(WARNING, format!("Replaces the earlier take at {}", replaces.join(", ")));
+                }
+                ui.separator();
+                match &dub.stage {
+                    DubStage::Preparing(job) => job.ui(ui),
+                    DubStage::Saving(job) => job.ui(ui),
+                    DubStage::Ready(_) => {
+                        ui.label("The edited video plays without sound while you speak. Recording stops by itself at the end of the selection.");
+                        if ui.button("⏺ Start recording").clicked() {
+                            start = true;
+                        }
+                    }
+                    DubStage::Countdown { go, .. } => {
+                        let left = go.saturating_duration_since(Instant::now()).as_secs_f64().ceil();
+                        ui.heading(format!("Starting in {left:.0}…"));
+                    }
+                    DubStage::Recording { clip: _, mic, offset } => {
+                        let done = (mic.position() - offset).max(0.0);
+                        ui.add(
+                            egui::ProgressBar::new((done / dub.length) as f32)
+                                .text(format!("Recording {} / {}", fmt_time(done), fmt_time(dub.length))),
+                        );
+                        if ui.button("⏹ Stop early").clicked() {
+                            stop = true;
+                        }
+                    }
+                    DubStage::Failed(e) => {
+                        ui.colored_label(WARNING, e);
+                    }
+                }
+                if !dub.script.is_empty() {
+                    ui.separator();
+                    ui.weak("Said there now:");
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| ui.label(RichText::new(&dub.script).size(16.0)));
+                }
+            });
+        if start
+            && let DubStage::Ready(clip) = std::mem::replace(&mut dub.stage, DubStage::Failed(String::new()))
+        {
+            let raw = self.project.base_dir().join(".scribecut-cache").join("voiceover-mic.wav");
+            dub.stage = match Microphone::start(&raw) {
+                Ok(mic) => DubStage::Countdown { clip, mic, go: Instant::now() + Duration::from_secs_f64(COUNTDOWN) },
+                Err(e) => DubStage::Failed(format!("{e:#}")),
+            };
+        }
+        if stop
+            && let DubStage::Recording { mic, offset, .. } = std::mem::replace(&mut dub.stage, DubStage::Failed(String::new()))
+        {
+            dub.stage = Self::save_take(&self.project, dub.range, dub.length, mic, offset, ctx);
+        }
+        // Closing throws the take away, except while it is being saved.
+        if !open && !matches!(dub.stage, DubStage::Saving(_)) {
+            self.dub = None;
         }
     }
 
@@ -468,9 +856,29 @@ impl Editor {
         {
             self.clean_audio_job = None;
             match result {
-                Ok(Some(audio)) => self.play_with_audio(&audio),
-                Ok(None) => {}
-                Err(e) => self.message = Some(format!("Playing the original audio, cleanup failed: {e:#}")),
+                Ok(Some(audio)) => {
+                    if !self.project.voiceovers.is_empty() {
+                        // The waveform shows what is heard, takes included.
+                        let peaks = audio.clone();
+                        self.waveform_job = Some(Job::spawn(&self.ctx, "Waveform", move |_| crate::media::audio_peaks(&peaks)));
+                    }
+                    self.programme = Some(audio);
+                }
+                Ok(None) => self.programme = Some(self.project.media.clone()),
+                Err(e) => {
+                    self.message = Some(format!("Playing the original audio, cleanup failed: {e:#}"));
+                    self.programme = Some(self.project.media.clone());
+                }
+            }
+            self.render_sound();
+        }
+        if let Some(job) = &mut self.sound_job
+            && let Some(result) = job.poll()
+        {
+            self.sound_job = None;
+            match result {
+                Ok(file) => self.use_sound(&file),
+                Err(e) => self.message = Some(format!("Preparing the audio failed: {e:#}")),
             }
         }
         if let Some(job) = &mut self.waveform_job
@@ -492,6 +900,7 @@ impl Editor {
             match result {
                 Ok((words, save_error)) => {
                     self.project.words = words;
+                    self.words = self.project.heard_words();
                     if save_error.is_some() {
                         self.message = save_error;
                     }
@@ -518,7 +927,7 @@ impl Editor {
         if let Some(i) = self.project.cut_at(self.pos) {
             let end = self.project.cuts[i].end;
             if end >= self.project.duration - 0.05 {
-                self.player.pause();
+                self.pause();
             } else {
                 self.seek(end);
             }
@@ -556,8 +965,11 @@ impl Editor {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() || self.dub.is_some() {
             return;
+        }
+        if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, Key::C)) {
+            self.center_view();
         }
         // Consume the keys before widgets run, so e.g. Space doesn't also press a focused button.
         // Shift variants first: consume_key ignores extra Shift when matching.
@@ -577,7 +989,7 @@ impl Editor {
             )
         });
         if space {
-            self.player.toggle();
+            self.toggle_play();
         }
         if i {
             self.mark_in();
@@ -603,6 +1015,12 @@ impl Editor {
         }
     }
 
+    /// Scrolls the timeline so the playhead is in the middle, keeping the zoom.
+    fn center_view(&mut self) {
+        let len = self.view.1;
+        self.view.0 = (self.pos - len / 2.0).clamp(0.0, (self.project.duration - len).max(0.0));
+    }
+
     fn mark_in(&mut self) {
         let end = self.selection.map_or(self.project.duration, |s| s.end.max(self.pos));
         self.selection = Some(Range::new(self.pos, end));
@@ -621,7 +1039,7 @@ impl Editor {
         ui.separator();
         let label = if self.player.playing { "Pause" } else { "▶ Play" };
         if ui.button(label).on_hover_text("Space").clicked() {
-            self.player.toggle();
+            self.toggle_play();
         }
         ui.monospace(format!("{} / {}", fmt_time(self.pos), fmt_time(self.project.duration)));
         ui.separator();
@@ -644,6 +1062,13 @@ impl Editor {
         }
         if ui.button("+ Slide…").on_hover_text("Show an image, PDF/presentation page or video clip instead of the screen for the selected time range").clicked() {
             self.add_slide();
+        }
+        if ui
+            .add_enabled(self.selection.is_some() && self.dub.is_none(), egui::Button::new("Re-record audio…"))
+            .on_hover_text("Speak the narration for the selection again, over the edited video")
+            .clicked()
+        {
+            self.open_dub();
         }
         let has_camera = self.project.camera_size.is_some();
         ui.add_enabled_ui(has_camera, |ui| {
@@ -686,7 +1111,7 @@ impl Editor {
                     self.start_export(ctx);
                 }
                 if ui
-                    .add_enabled(!self.project.words.is_empty(), egui::Button::new("Export script…"))
+                    .add_enabled(!self.words.is_empty(), egui::Button::new("Export script…"))
                     .on_hover_text("The transcript after cuts, as Markdown, to re-record from")
                     .clicked()
                 {
@@ -728,6 +1153,22 @@ impl Editor {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::BLACK);
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        // While re-recording: the edited picture of the range, and the countdown.
+        if let Some(dub) = &self.dub {
+            if let Some(tex) = &dub.texture {
+                painter.image(tex.id(), rect, uv, Color32::WHITE);
+            }
+            if let DubStage::Countdown { go, .. } = &dub.stage {
+                let left = go.saturating_duration_since(Instant::now()).as_secs_f64().ceil();
+                // On a dark disc: the picture behind it is often a white page.
+                painter.circle_filled(rect.center(), rect.height() / 6.0, Color32::from_black_alpha(170));
+                painter.text(rect.center(), Align2::CENTER_CENTER, format!("{left:.0}"), FontId::proportional(rect.height() / 5.0), Color32::WHITE);
+            }
+            if let DubStage::Recording { .. } = &dub.stage {
+                painter.circle_filled(rect.left_top() + vec2(24.0, 24.0), 10.0, Color32::RED);
+            }
+            return;
+        }
         if let Some(tex) = &self.texture {
             painter.image(tex.id(), rect, uv, Color32::WHITE);
         }
@@ -801,7 +1242,7 @@ impl Editor {
                 paint_overlay(&painter, rect, &draft.overlay, None);
             }
         } else if response.clicked() {
-            self.player.toggle();
+            self.toggle_play();
         }
     }
 
@@ -1080,7 +1521,7 @@ impl Editor {
         // Words as alternating blocks, labelled when zoomed in far enough.
         let shades = [Color32::from_gray(55), Color32::from_gray(75)];
         let word_font = FontId::proportional(11.0);
-        for (i, w) in self.project.words.iter().enumerate() {
+        for (i, w) in self.words.iter().enumerate() {
             if w.end < start || w.start > start + len {
                 continue;
             }
@@ -1092,6 +1533,16 @@ impl Editor {
         }
 
         self.paint_waveform(&painter, wave);
+        for v in &self.project.voiceovers {
+            let r = self.span(wave, v.start, v.end);
+            painter.rect_filled(r, 0.0, VOICEOVER);
+            let stale = self.project.voiceover_problem(v).is_some();
+            if stale {
+                painter.rect_stroke(r, 0.0, Stroke::new(2.0, WARNING), egui::StrokeKind::Inside);
+            }
+            let label = if stale { "re-recorded - needs attention, see the list" } else { "re-recorded" };
+            painter.with_clip_rect(r).text(r.left_top() + vec2(4.0, 2.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), Color32::WHITE);
+        }
 
         // Cuts, selection and resume points span the word track and the waveform.
         let edit_area = track.union(wave);
@@ -1192,7 +1643,7 @@ impl Editor {
             }
         }
         response.on_hover_text_at_pointer(
-            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan\nRight-click a red cut to restore it · Click a slide (purple) or overlay (green) bar to edit it\nCamera strip: orange = only me, brown = small window; right-click an outlined range to remove it",
+            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan · C: centre on the playhead\nRight-click a red cut to restore it · Click a slide (purple) or overlay (green) bar to edit it\nCamera strip: orange = only me, brown = small window; right-click an outlined range to remove it",
         );
     }
 
@@ -1225,7 +1676,7 @@ impl Editor {
         // Word starts as faint guides, to relate the gaps to the transcript.
         let guide = Stroke::new(1.0, Color32::from_white_alpha(28));
         let (start, len) = self.view;
-        for w in self.project.words.iter().filter(|w| w.start >= start && w.start <= start + len) {
+        for w in self.words.iter().filter(|w| w.start >= start && w.start <= start + len) {
             let x = self.t_to_x(wave, w.start);
             painter.line_segment([pos2(x, wave.top()), pos2(x, wave.bottom())], guide);
         }
@@ -1286,14 +1737,14 @@ impl Editor {
     }
 
     fn transcript(&mut self, ui: &mut egui::Ui) {
-        let current = self.project.word_at(self.pos);
+        let current = word_at(&self.words, self.pos);
         let scroll_to_current = self.player.playing && current != self.last_scrolled_word;
         let shift = ui.input(|i| i.modifiers.shift);
         let mut clicked = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
             let mut boundaries = self.project.segment_starts.iter().peekable();
-            for (i, w) in self.project.words.iter().enumerate() {
+            for (i, w) in self.words.iter().enumerate() {
                 if let Some(&&b) = boundaries.peek()
                     && w.start >= b
                 {
@@ -1301,7 +1752,7 @@ impl Editor {
                     ui.end_row();
                     ui.label(RichText::new("— resumed —").small().color(SEGMENT));
                     ui.end_row();
-                } else if i > 0 && w.start - self.project.words[i - 1].end > 1.5 {
+                } else if i > 0 && w.start - self.words[i - 1].end > 1.5 {
                     ui.end_row();
                 }
                 let mut text = RichText::new(&w.text).size(15.0);
@@ -1327,15 +1778,15 @@ impl Editor {
         if scroll_to_current {
             self.last_scrolled_word = current;
         }
-        if self.project.words.is_empty() && self.transcription.is_none() && self.project.has_audio {
+        if self.words.is_empty() && self.transcription.is_none() && self.project.has_audio {
             ui.weak("No speech found.");
         }
 
         if let Some(i) = clicked {
-            let w = &self.project.words[i];
+            let w = &self.words[i];
             match self.anchor_word.filter(|_| shift) {
                 Some(a) => {
-                    let a = &self.project.words[a.min(self.project.words.len() - 1)];
+                    let a = &self.words[a.min(self.words.len() - 1)];
                     self.selection = Some(Range::new(a.start.min(w.start), a.end.max(w.end)));
                 }
                 None => {
@@ -1417,6 +1868,30 @@ impl Editor {
                         });
                     }
                 });
+        }
+        let mut remove_voiceover = None;
+        egui::CollapsingHeader::new(format!("Re-recorded audio ({})", self.project.voiceovers.len()))
+            .default_open(true)
+            .show(ui, |ui| {
+                for (i, v) in self.project.voiceovers.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.link(format!("{} – {}", fmt_time(v.start), fmt_time(v.end))).clicked() {
+                            seek = Some(v.start);
+                        }
+                        ui.label(v.file.file_name().unwrap_or_default().to_string_lossy());
+                        if let Some(problem) = self.project.voiceover_problem(v) {
+                            ui.colored_label(WARNING, "needs attention").on_hover_text(problem);
+                        }
+                        if ui.small_button("Remove").on_hover_text("Back to the recording's own sound").clicked() {
+                            remove_voiceover = Some(i);
+                        }
+                    });
+                }
+            });
+        if let Some(i) = remove_voiceover {
+            self.edit(|p| {
+                p.voiceovers.remove(i);
+            });
         }
         if let Some(t) = seek {
             self.seek(t);

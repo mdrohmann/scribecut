@@ -191,6 +191,11 @@ for s in plan.get("slides", []):
 out = [f'[[cut]]\nfrom = "{t(a)}"\nto = "{t(b)}"\nnote = {json.dumps(n)}\n' for a, b, n in merged]
 for a, b, f, p in slides:
     out.append(f'[[slide]]\nfrom = "{t(a)}"\nto = "{t(b)}"\nfile = {json.dumps(f)}\npage = {p}\n')
+# Re-recorded narration is made in the app after the cuts: keep it.
+current = open(edit_path).read()
+for block in current.split("\n[[")[1:]:
+    if block.startswith("voiceover]]"):
+        out.append("[[" + block.rstrip() + "\n")
 head = base_text.split("\n[[")[0].rstrip() + "\n"
 open(edit_path, "w").write(head + "\n" + "\n".join(out))
 

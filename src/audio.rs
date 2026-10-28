@@ -214,34 +214,123 @@ pub fn cleanup(input: &Path) -> Option<String> {
     result
 }
 
-/// The cleaned-up narration of `media` as a FLAC file for the editor's
-/// playback, rendered once into `.scribecut-cache/` next to it. `None` when
-/// cleanup is off. Takes a few seconds per minute of recording.
-pub fn render_clean(media: &Path) -> anyhow::Result<Option<PathBuf>> {
+/// The narration for the editor's playback as a FLAC file: cleaned up, with
+/// any re-recorded takes spliced in, rendered once into `.scribecut-cache/`
+/// next to the recording. `None` when there is nothing to change about the
+/// recording's own sound. Takes a few seconds per minute of recording.
+pub fn render_clean(p: &crate::project::Project) -> anyhow::Result<Option<PathBuf>> {
     use anyhow::Context as _;
-    let Some(chain) = cleanup(media) else { return Ok(None) };
+    use std::hash::{Hash, Hasher};
+    let media = &p.media;
+    let chain = cleanup(media);
+    let splice = crate::voiceover::splice(p, "[0:a:0]", 1, "[spliced]");
+    if chain.is_none() && splice.is_none() {
+        return Ok(None);
+    }
     let dir = media.parent().unwrap_or(Path::new(".")).join(".scribecut-cache");
     std::fs::create_dir_all(&dir)?;
+    let modified = |f: &Path| std::fs::metadata(f).and_then(|m| m.modified()).ok();
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&chain, &mut h);
-    std::hash::Hash::hash(&std::fs::metadata(media).and_then(|m| m.modified()).ok(), &mut h);
+    chain.hash(&mut h);
+    splice.hash(&mut h);
+    modified(media).hash(&mut h);
+    for v in &p.voiceovers {
+        let file = p.resolve(&v.file);
+        file.hash(&mut h);
+        modified(&file).hash(&mut h);
+    }
     let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
-    let out = dir.join(format!("{stem}-clean-{:016x}.flac", std::hash::Hasher::finish(&h)));
+    let out = dir.join(format!("{stem}-clean-{:016x}.flac", h.finish()));
     if out.is_file() {
         return Ok(Some(out));
     }
+    let (source, mut graph) = match &splice {
+        Some(splice) => ("[spliced]", format!("{splice};")),
+        None => ("[0:a:0]", String::new()),
+    };
+    graph.push_str(&format!("{source}{}[out]", chain.as_deref().unwrap_or("anull")));
     let part = out.with_extension("part.flac");
-    let status = crate::media::ffmpeg()
+    let mut cmd = crate::media::ffmpeg();
+    cmd.stdin(std::process::Stdio::null()).args(["-nostdin", "-y", "-v", "error", "-i"]).arg(media);
+    for v in &p.voiceovers {
+        cmd.arg("-i").arg(p.resolve(&v.file));
+    }
+    let output = cmd
+        .args(["-filter_complex", &graph, "-map", "[out]", "-c:a", "flac"])
+        .arg(&part)
+        .output()
+        .context("running ffmpeg")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ffmpeg could not render the audio: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    std::fs::rename(&part, &out)?;
+    // Earlier renders for other takes or cuts are not needed again. Playback
+    // may still have one open, which is fine: it goes when closed.
+    let prefix = format!("{stem}-clean-");
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".flac") && !name.contains(".part") && entry.path() != out {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(Some(out))
+}
+
+/// `programme` (the sound on the source timeline: [`render_clean`]'s file,
+/// or the recording itself) with everything outside `kept` removed, as the
+/// export will have it, rendered into `.scribecut-cache/` next to `media`.
+/// Takes a couple of seconds: no filtering, only cutting and joining.
+pub fn render_cut(media: &Path, programme: &Path, kept: &[crate::project::Range]) -> anyhow::Result<PathBuf> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+    use std::hash::{Hash, Hasher};
+    anyhow::ensure!(!kept.is_empty(), "everything is cut");
+    let dir = media.parent().unwrap_or(Path::new(".")).join(".scribecut-cache");
+    std::fs::create_dir_all(&dir)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    programme.hash(&mut h);
+    std::fs::metadata(programme).and_then(|m| m.modified()).ok().hash(&mut h);
+    for r in kept {
+        (r.start.to_bits(), r.end.to_bits()).hash(&mut h);
+    }
+    let stem = media.file_stem().and_then(|s| s.to_str()).unwrap_or("audio");
+    let prefix = format!("{stem}-cut-");
+    let out = dir.join(format!("{prefix}{:016x}.flac", h.finish()));
+    if out.is_file() {
+        return Ok(out);
+    }
+    let n = kept.len();
+    let mut graph = format!("[0:a:0]asplit={n}{};", (0..n).map(|i| format!("[s{i}]")).collect::<String>());
+    for (i, r) in kept.iter().enumerate() {
+        let _ = write!(graph, "[s{i}]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS[p{i}];", r.start, r.end);
+    }
+    let _ = write!(graph, "{}concat=n={n}:v=0:a=1[out]", (0..n).map(|i| format!("[p{i}]")).collect::<String>());
+    let part = out.with_extension("part.flac");
+    let output = crate::media::ffmpeg()
         .stdin(std::process::Stdio::null())
         .args(["-nostdin", "-y", "-v", "error", "-i"])
-        .arg(media)
-        .args(["-map", "0:a:0", "-af", &chain, "-c:a", "flac"])
+        .arg(programme)
+        .args(["-filter_complex", &graph, "-map", "[out]", "-c:a", "flac"])
         .arg(&part)
-        .status()
+        .output()
         .context("running ffmpeg")?;
-    anyhow::ensure!(status.success(), "ffmpeg could not clean up the audio");
+    anyhow::ensure!(
+        output.status.success(),
+        "ffmpeg could not cut the audio: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     std::fs::rename(&part, &out)?;
-    Ok(Some(out))
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && !name.contains(".part") && entry.path() != out {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(out)
 }
 
 /// Integrated loudness (LUFS) of the first audio track after `filters`.

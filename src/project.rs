@@ -1,5 +1,5 @@
 //! Project data model: media file, transcript words, cuts, text overlays,
-//! slides and camera layout. Stored by `edit_file`.
+//! slides, camera layout and re-recorded audio. Stored by `edit_file`.
 
 use std::path::{Path, PathBuf};
 
@@ -74,6 +74,28 @@ pub struct Slide {
     pub page: u32,
     /// For video clips: where in the clip playback starts.
     pub clip_start: f64,
+}
+
+/// Narration recorded again for `[start, end)`, replacing the recording's own
+/// sound there. It was spoken over the edited video, so the file holds the
+/// parts of the range that were kept at the time (`pieces`), back to back.
+/// Cuts made later inside the range remove the narration along with the
+/// picture.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Voiceover {
+    pub start: f64,
+    pub end: f64,
+    /// As written in the edit file; relative paths are relative to its folder.
+    pub file: PathBuf,
+    /// The source ranges the file covers, in order: what was kept of
+    /// `[start, end)` when it was recorded.
+    pub pieces: Vec<Range>,
+    /// Older edit files only kept the length recorded over, not the pieces.
+    /// Set when that length no longer matches the cuts, so which parts of the
+    /// file belong where is unknown.
+    pub stale_length: Option<f64>,
+    /// What was said, on the file's own timeline (from its transcript file).
+    pub words: Vec<Word>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -174,13 +196,15 @@ pub struct Project {
     pub camera_size: Option<(u32, u32)>,
     /// Start times of each recorded piece after the first (pause/resume points).
     pub segment_starts: Vec<f64>,
-    /// From the transcript file, not the edit file.
+    /// From the transcript file, not the edit file: the recording's own
+    /// words. [`Project::heard_words`] has them with re-recorded audio applied.
     pub words: Vec<Word>,
     pub cuts: Vec<Cut>,
     pub overlays: Vec<Overlay>,
     pub slides: Vec<Slide>,
     pub camera: CameraSettings,
     pub camera_ranges: Vec<CameraRange>,
+    pub voiceovers: Vec<Voiceover>,
 }
 
 impl Project {
@@ -327,11 +351,115 @@ impl Project {
         self.kept_ranges().iter().map(|r| (t.min(r.end) - r.start).max(0.0)).sum()
     }
 
-    /// Index of the word being spoken at `t` (or the last one before it).
-    pub fn word_at(&self, t: f64) -> Option<usize> {
-        let i = self.words.partition_point(|w| w.start <= t);
-        (i > 0).then(|| i - 1).filter(|&i| t < self.words[i].end.max(self.words[i].start + 0.05) + 0.5)
+    /// The kept parts of `range`, each with where it starts in a recording
+    /// made over the edited video (seconds after the range's start).
+    pub fn kept_pieces(&self, range: Range) -> Vec<(Range, f64)> {
+        let mut offset = 0.0;
+        let mut out = Vec::new();
+        for k in self.kept_ranges() {
+            let piece = Range { start: k.start.max(range.start), end: k.end.min(range.end) };
+            if piece.len() > 1e-3 {
+                out.push((piece, offset));
+                offset += piece.len();
+            }
+        }
+        out
     }
+
+    /// Seconds of `range` left after the cuts.
+    pub fn kept_length(&self, range: Range) -> f64 {
+        self.kept_pieces(range).iter().map(|(r, _)| r.len()).sum()
+    }
+
+    /// What is wrong with a voiceover, if anything: kept parts of its range
+    /// that it has no narration for (a cut restored after recording), or an
+    /// older take that no longer lines up.
+    pub fn voiceover_problem(&self, v: &Voiceover) -> Option<String> {
+        if let Some(length) = v.stale_length {
+            return Some(format!(
+                "the cuts inside it changed since it was recorded ({length:.2}s then, {:.2}s now) and the \
+                 edit file doesn't say which cuts it was recorded with - record it again",
+                self.kept_length(Range { start: v.start, end: v.end })
+            ));
+        }
+        // Kept time in the range minus the kept time the pieces cover.
+        let kept = self.kept_pieces(Range { start: v.start, end: v.end });
+        let kept_len: f64 = kept.iter().map(|(r, _)| r.len()).sum();
+        let covered: f64 = kept
+            .iter()
+            .flat_map(|(r, _)| v.pieces.iter().map(move |p| (p.end.min(r.end) - p.start.max(r.start)).max(0.0)))
+            .sum();
+        let gap = kept_len - covered;
+        (gap > 0.05).then(|| {
+            format!("{gap:.1}s inside it has no narration (a cut there was restored after it was recorded)")
+        })
+    }
+
+    /// A voiceover's pieces, each with where it starts in the file.
+    pub fn take_pieces(v: &Voiceover) -> Vec<(Range, f64)> {
+        let mut offset = 0.0;
+        v.pieces
+            .iter()
+            .map(|p| {
+                let at = offset;
+                offset += p.len();
+                (*p, at)
+            })
+            .collect()
+    }
+
+    /// Source time at `t` seconds into the exported video (the inverse of
+    /// [`Project::output_time`]).
+    pub fn source_time(&self, t: f64) -> f64 {
+        let mut left = t.max(0.0);
+        let kept = self.kept_ranges();
+        for r in &kept {
+            if left <= r.len() {
+                return r.start + left;
+            }
+            left -= r.len();
+        }
+        kept.last().map_or(0.0, |r| r.end)
+    }
+
+    /// Adds a re-recording, replacing any earlier one it overlaps.
+    pub fn add_voiceover(&mut self, v: Voiceover) {
+        self.voiceovers.retain(|o| o.end <= v.start || o.start >= v.end);
+        self.voiceovers.push(v);
+        self.voiceovers.sort_by(|a, b| a.start.total_cmp(&b.start));
+    }
+
+    /// The words as the viewer hears them: the recording's own, with those in
+    /// re-recorded ranges replaced by what was said in the re-recording.
+    pub fn heard_words(&self) -> Vec<Word> {
+        let mut words: Vec<Word> = self
+            .words
+            .iter()
+            .filter(|w| {
+                let mid = (w.start + w.end) / 2.0;
+                !self.voiceovers.iter().any(|v| v.start <= mid && mid < v.end)
+            })
+            .cloned()
+            .collect();
+        for v in &self.voiceovers {
+            let pieces = Self::take_pieces(v);
+            for w in &v.words {
+                // A word in the file belongs to the piece that was showing.
+                let Some((piece, offset)) = pieces.iter().rev().find(|(_, o)| *o <= w.start + 1e-6) else { continue };
+                let start = piece.start + (w.start - offset);
+                let end = (piece.start + (w.end - offset)).min(piece.end).max(start);
+                words.push(Word { text: w.text.clone(), start, end });
+            }
+        }
+        words.sort_by(|a, b| a.start.total_cmp(&b.start));
+        words
+    }
+}
+
+/// Index of the word being spoken at `t` (or the last one before it).
+pub fn word_at(words: &[Word], t: f64) -> Option<usize> {
+    let i = words.partition_point(|w| w.start <= t);
+    (i > 0).then(|| i - 1).filter(|&i| t < words[i].end.max(words[i].start + 0.05) + 0.5)
 }
 
 #[cfg(test)]
@@ -373,10 +501,49 @@ mod tests {
             Word { text: "a".into(), start: 1.0, end: 1.5 },
             Word { text: "b".into(), start: 2.0, end: 2.4 },
         ];
-        assert_eq!(p.word_at(0.5), None);
-        assert_eq!(p.word_at(1.2), Some(0));
-        assert_eq!(p.word_at(2.1), Some(1));
-        assert_eq!(p.word_at(10.0), None);
+        assert_eq!(word_at(&p.words, 0.5), None);
+        assert_eq!(word_at(&p.words, 1.2), Some(0));
+        assert_eq!(word_at(&p.words, 2.1), Some(1));
+        assert_eq!(word_at(&p.words, 10.0), None);
+    }
+
+    #[test]
+    fn voiceover_spans_a_cut() {
+        let mut p = project();
+        p.add_cut(Range::new(5.0, 7.0));
+        let range = Range::new(4.0, 9.0);
+        assert_eq!(
+            p.kept_pieces(range),
+            vec![(Range { start: 4.0, end: 5.0 }, 0.0), (Range { start: 7.0, end: 9.0 }, 1.0)]
+        );
+        assert_eq!(p.kept_length(range), 3.0);
+        let w = |t: &str, s: f64| Word { text: t.into(), start: s, end: s + 0.4 };
+        p.words = vec![w("old", 1.0), w("gone", 4.2), w("cut", 6.0), w("also", 8.0), w("kept", 9.5)];
+        let v = |start, end, words| Voiceover {
+            start,
+            end,
+            file: "v.flac".into(),
+            pieces: vec![Range { start: 4.0, end: 5.0 }, Range { start: 7.0, end: 9.0 }],
+            stale_length: None,
+            words,
+        };
+        p.add_voiceover(v(4.0, 9.0, vec![w("new", 0.1), w("words", 1.5)]));
+        let heard: Vec<(String, f64)> = p.heard_words().into_iter().map(|w| (w.text, w.start)).collect();
+        // 1.5 s into the file is 0.5 s into the second piece, which starts at 7.
+        assert_eq!(heard, [("old".into(), 1.0), ("new".into(), 4.1), ("words".into(), 7.5), ("kept".into(), 9.5)]);
+        assert_eq!(p.voiceover_problem(&p.voiceovers[0]), None);
+        // A later cut inside the range takes narration and picture out together.
+        p.add_cut(Range::new(7.5, 8.0));
+        assert_eq!(p.voiceover_problem(&p.voiceovers[0]), None);
+        // Restoring the cut it was recorded around leaves a part without narration.
+        p.cuts.clear();
+        let problem = p.voiceover_problem(&p.voiceovers[0]).unwrap();
+        assert!(problem.starts_with("2.0s inside it has no narration"), "{problem}");
+        assert_eq!(p.source_time(p.output_time(8.5)), 8.5);
+        // A new take replaces the one it overlaps.
+        p.add_voiceover(v(8.0, 10.0, vec![]));
+        p.add_voiceover(v(12.0, 13.0, vec![]));
+        assert_eq!(p.voiceovers.iter().map(|v| v.start).collect::<Vec<_>>(), [8.0, 12.0]);
     }
 
     #[test]

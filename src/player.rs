@@ -24,18 +24,17 @@ pub struct Player {
 impl Player {
     /// `preview` is the size frames are scaled to before reaching the UI.
     pub fn new(path: &Path, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
-        Self::open(path, preview, ctx, 0, true, None)
+        Self::open(path, preview, ctx, 0, true)
     }
 
     /// Plays video stream `stream` (e.g. 1 = the camera track) without audio.
     pub fn silent_stream(path: &Path, stream: i32, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
-        Self::open(path, preview, ctx, stream, false, None)
+        Self::open(path, preview, ctx, stream, false)
     }
 
-    /// Plays the video's first video stream with the sound from `audio` instead
-    /// of its own (the cleaned-up narration).
-    pub fn with_audio(path: &Path, audio: &Path, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
-        Self::open(path, preview, ctx, 0, false, Some(audio))
+    /// Plays the video's picture without its sound.
+    pub fn silent(path: &Path, preview: (u32, u32), ctx: egui::Context) -> Result<Self> {
+        Self::open(path, preview, ctx, 0, false)
     }
 
     fn open(
@@ -44,7 +43,6 @@ impl Player {
         ctx: egui::Context,
         stream: i32,
         audio: bool,
-        audio_file: Option<&Path>,
     ) -> Result<Self> {
         let uri = gst::glib::filename_to_uri(path, None)?;
         let (w, h) = preview;
@@ -83,8 +81,7 @@ impl Player {
                 })
                 .build(),
         );
-        let audio_uri = audio_file.map(|f| gst::glib::filename_to_uri(f, None)).transpose()?;
-        let playbin = if stream == 0 && audio_uri.is_none() {
+        let playbin = if stream == 0 {
             let playbin = gst::ElementFactory::make("playbin").property("uri", uri.as_str()).build()?;
             if !audio {
                 let sink = gst::ElementFactory::make("fakesink").property("sync", true).build()?;
@@ -95,7 +92,7 @@ impl Player {
         } else {
             // playbin's `current-video` doesn't reliably switch tracks, so decode
             // the file ourselves and show only the wanted video stream.
-            stream_pipeline(uri.as_str(), stream, bin.upcast(), audio_uri.as_deref())?.upcast()
+            stream_pipeline(uri.as_str(), stream, bin.upcast())?.upcast()
         };
         playbin.set_state(gst::State::Paused).context("opening video")?;
         // Wait for preroll so the first frame shows and seeking works immediately.
@@ -112,10 +109,6 @@ impl Player {
     pub fn pause(&mut self) {
         let _ = self.playbin.set_state(gst::State::Paused);
         self.playing = false;
-    }
-
-    pub fn toggle(&mut self) {
-        if self.playing { self.pause() } else { self.play() }
     }
 
     pub fn seek(&mut self, t: f64) {
@@ -160,20 +153,8 @@ impl Drop for Player {
 
 /// Decodes `uri`, sending video stream number `stream` to `sink` and every
 /// other stream to a fakesink (unlinked streams would stop the demuxer).
-/// With `audio`, that file's sound plays alongside, on the same clock.
-fn stream_pipeline(uri: &str, stream: i32, sink: gst::Element, audio: Option<&str>) -> Result<gst::Pipeline> {
+fn stream_pipeline(uri: &str, stream: i32, sink: gst::Element) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
-    if let Some(audio) = audio {
-        let decode = gst::ElementFactory::make("uridecodebin").property("uri", audio).build()?;
-        let out = gst::parse::bin_from_description("audioconvert ! audioresample ! autoaudiosink", true)?;
-        pipeline.add_many([&decode, out.upcast_ref()])?;
-        let out_pad = out.static_pad("sink").context("no audio sink pad")?;
-        decode.connect_pad_added(move |_, pad| {
-            if !out_pad.is_linked() {
-                let _ = pad.link(&out_pad);
-            }
-        });
-    }
     let decode = gst::ElementFactory::make("uridecodebin").property("uri", uri).build()?;
     pipeline.add_many([&decode, &sink])?;
     let sink_pad = sink.static_pad("sink").context("no sink pad")?;

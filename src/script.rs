@@ -14,8 +14,8 @@ const PARAGRAPH_GAP: f64 = 1.5;
 pub fn script(p: &Project) -> String {
     let title = p.media.file_stem().and_then(|s| s.to_str()).unwrap_or("Recording");
     let mut out = format!("# {title}\n");
-    let kept: Vec<&Word> = p
-        .words
+    let heard = p.heard_words();
+    let kept: Vec<&Word> = heard
         .iter()
         .filter(|w| p.cut_at((w.start + w.end) / 2.0).is_none())
         .collect();
@@ -55,7 +55,7 @@ pub fn script(p: &Project) -> String {
         let _ = write!(line, "*[On screen: “{}”]* ", o.text.replace('\n', " / "));
     }
     flush(&mut out, &mut line);
-    if p.words.is_empty() {
+    if heard.is_empty() {
         out.push_str("\n*(no transcript)*\n");
     }
     out

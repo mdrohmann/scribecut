@@ -8,7 +8,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
-use crate::project::{CameraMode, Corner, Project};
+use crate::project::{CameraMode, Corner, Project, Range};
 use crate::sources::{self, Input};
 
 /// Single-quotes a filtergraph option value (paths must not contain ":").
@@ -28,7 +28,8 @@ fn fit(w: u32, h: u32) -> String {
 }
 
 /// Builds the `-filter_complex` graph. Input 0 is the recording (camera = its
-/// 2nd video stream); input `i + 1` is slide `i`, a video clip if `clips[i]`.
+/// 2nd video stream); input `i + 1` is slide `i`, a video clip if `clips[i]`;
+/// after the slides come the voiceover takes, in order.
 /// `text_files[i]` holds overlay i's text.
 /// `audio_cleanup` is an ffmpeg filter chain applied to the finished
 /// programme, after the kept ranges have been joined, so that leveling and
@@ -111,19 +112,44 @@ pub fn filter_graph(
     let n = kept.len();
     let _ = write!(g, "[vov]split={n}{};", (0..n).map(|i| format!("[vs{i}]")).collect::<String>());
     if p.has_audio {
-        let _ = write!(g, "[0:a]asplit={n}{};", (0..n).map(|i| format!("[as{i}]")).collect::<String>());
+        // Re-recorded narration goes in on the source timeline, so that it is
+        // cut along with everything else.
+        let audio = match crate::voiceover::splice(p, "[0:a]", 1 + p.slides.len(), "[spliced]") {
+            Some(splice) => {
+                let _ = write!(g, "{splice};");
+                "[spliced]"
+            }
+            None => "[0:a]",
+        };
+        let _ = write!(g, "{audio}asplit={n}{};", (0..n).map(|i| format!("[as{i}]")).collect::<String>());
     }
-    for (i, r) in kept.iter().enumerate() {
-        let _ = write!(g, "[vs{i}]trim=start={:.4}:end={:.4},setpts=PTS-STARTPTS[v{i}];", r.start, r.end);
+    let frames = piece_frames(&kept, p.fps);
+    let fps = p.fps.max(1.0);
+    for (i, (r, &n)) in kept.iter().zip(&frames).enumerate() {
+        if n == 0 {
+            let _ = write!(g, "[vs{i}]nullsink;");
+        } else {
+            // Exactly `n` frames from the piece's start (one spare frame's time
+            // read, then capped), so the picture's length tracks the sound's.
+            let _ = write!(
+                g,
+                "[vs{i}]trim=start={:.4}:end={:.4},setpts=PTS-STARTPTS,trim=end_frame={n}[v{i}];",
+                r.start,
+                r.start + (n as f64 + 1.0) / fps,
+            );
+        }
         if p.has_audio {
             let _ = write!(g, "[as{i}]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS[a{i}];", r.start, r.end);
         }
     }
-    let inputs: String = (0..n)
-        .map(|i| if p.has_audio { format!("[v{i}][a{i}]") } else { format!("[v{i}]") })
-        .collect();
-    let _ = write!(g, "{inputs}concat=n={n}:v=1:a={}[outv]", u8::from(p.has_audio));
+    // Picture and sound are joined separately. A video piece can only end on
+    // a whole frame; joined together, `concat` pads the sound of every piece
+    // to its picture with silence, which is a dropout in the middle of a
+    // word wherever narration runs across a cut.
+    let pictures: Vec<String> = (0..n).filter(|&i| frames[i] > 0).map(|i| format!("[v{i}]")).collect();
+    let _ = write!(g, "{}concat=n={}:v=1:a=0[outv]", pictures.concat(), pictures.len());
     if p.has_audio {
+        let _ = write!(g, ";{}concat=n={n}:v=0:a=1", (0..n).map(|i| format!("[a{i}]")).collect::<String>());
         match audio_cleanup {
             Some(cleanup) => {
                 let _ = write!(g, "[acat];[acat]{cleanup}[outa]");
@@ -134,12 +160,50 @@ pub fn filter_graph(
     g
 }
 
+/// How many frames of each kept piece to show. Each piece's picture can only
+/// end on a whole frame; rounding every piece on its own adds up over many
+/// cuts, so the picture would drift away from the sound (which is cut
+/// exactly). Rounding where each piece ends *in the export* instead keeps the
+/// picture within half a frame of the sound throughout.
+fn piece_frames(kept: &[Range], fps: f64) -> Vec<u64> {
+    let fps = fps.max(1.0);
+    let mut end = 0.0;
+    let mut shown = 0u64;
+    kept.iter()
+        .map(|r| {
+            end += r.len();
+            let until = (end * fps).round() as u64;
+            let n = until.saturating_sub(shown);
+            shown += n;
+            n
+        })
+        .collect()
+}
+
 /// Runs the export, calling `progress` with 0..1. Blocks until done.
-pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<()> {
+pub fn export(p: &Project, out: &Path, progress: impl FnMut(f32)) -> Result<()> {
+    render(p, out, None, progress)
+}
+
+/// The edited picture of `range` alone (cuts, slides, camera and text as in
+/// the export), silent and at most `width` pixels wide: what is shown while
+/// the narration for that range is recorded again.
+pub fn preview_clip(p: &Project, range: Range, width: u32, out: &Path, progress: impl FnMut(f32)) -> Result<()> {
+    let mut clip = Project { has_audio: false, voiceovers: Vec::new(), ..p.clone() };
+    clip.add_cut(Range::new(0.0, range.start));
+    clip.add_cut(Range::new(range.end, clip.duration));
+    render(&clip, out, Some(width), progress)
+}
+
+/// [`export`], or with `small: Some(width)` a quick, small preview.
+fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(f32)) -> Result<()> {
     if p.kept_ranges().is_empty() {
         bail!("everything is cut - nothing to export");
     }
-    let tmp = std::env::temp_dir().join(format!("scribecut-export-{}", std::process::id()));
+    // A folder per render: a preview clip can be made while an export runs.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("scribecut-export-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
     let text_files: Vec<PathBuf> = p
         .overlays
@@ -159,7 +223,14 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
         .collect::<Result<_>>()?;
     let clips: Vec<bool> = inputs.iter().map(|i| matches!(i, Input::Clip { .. })).collect();
     let cleanup = crate::audio::cleanup(&p.media);
-    let graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref());
+    let mut graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref());
+    let video_out = match small {
+        Some(width) => {
+            let _ = write!(graph, ";[outv]scale='min({width},iw)':-2[small]");
+            "[small]"
+        }
+        None => "[outv]",
+    };
 
     let mut cmd = crate::media::ffmpeg();
     // -nostdin + null stdin: ffmpeg must not touch the terminal, or a
@@ -177,7 +248,12 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
                 .arg(path),
         };
     }
-    cmd.args(["-filter_complex", &graph, "-map", "[outv]"]);
+    if p.has_audio {
+        for v in &p.voiceovers {
+            cmd.arg("-i").arg(p.resolve(&v.file));
+        }
+    }
+    cmd.args(["-filter_complex", &graph, "-map", video_out]);
     if p.has_audio {
         // Stereo AAC-LC at 48 kHz: what Slack, browsers and phones all play.
         // The microphone track is mono, which some players reject or play on
@@ -186,7 +262,8 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
     }
     // H.264 High, 4:2:0, constant frame rate, `avc1` tag, index at the front
     // (`+faststart`): the MP4 flavour Slack and browsers play inline.
-    cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
+    let (preset, crf) = if small.is_some() { ("ultrafast", "26") } else { ("veryfast", "20") };
+    cmd.args(["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p"])
         .args(["-profile:v", "high", "-fps_mode", "cfr", "-tag:v", "avc1"])
         .args(["-movflags", "+faststart"])
         .arg(out)
@@ -212,7 +289,7 @@ pub fn export(p: &Project, out: &Path, mut progress: impl FnMut(f32)) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{Overlay, Range, Slide};
+    use crate::project::{Overlay, Slide};
     use std::process::Command;
 
     fn project() -> Project {
@@ -225,9 +302,9 @@ mod tests {
         assert_eq!(
             g,
             "[0:v:0]null[vov];[vov]split=1[vs0];[0:a]asplit=1[as0];\
-             [vs0]trim=start=0.0000:end=20.0000,setpts=PTS-STARTPTS[v0];\
+             [vs0]trim=start=0.0000:end=20.0333,setpts=PTS-STARTPTS,trim=end_frame=600[v0];\
              [as0]atrim=start=0.0000:end=20.0000,asetpts=PTS-STARTPTS[a0];\
-             [v0][a0]concat=n=1:v=1:a=1[outv][outa]"
+             [v0]concat=n=1:v=1:a=0[outv];[a0]concat=n=1:v=0:a=1[outa]"
         );
     }
 
@@ -241,10 +318,28 @@ mod tests {
         assert!(g.starts_with("[0:v:0]drawtext=fontfile='/f/a b.ttf':textfile='/t/o0.txt':"));
         assert!(g.contains("fontsize=72:fontcolor=0xff0010:"));
         assert!(g.contains("x=w*0.25000-text_w/2:y=h*0.75000-text_h/2:enable='between(t,1.000,3.500)'[vov]"));
-        assert!(g.contains("[vs0]trim=start=0.0000:end=5.0000"));
-        assert!(g.contains("[vs1]trim=start=8.0000:end=20.0000"));
+        assert!(g.contains("[vs0]trim=start=0.0000:end=5.0333,setpts=PTS-STARTPTS,trim=end_frame=150[v0]"), "{g}");
+        assert!(g.contains("[vs1]trim=start=8.0000:end=20.0333,setpts=PTS-STARTPTS,trim=end_frame=360[v1]"), "{g}");
         assert!(g.ends_with("[v0][v1]concat=n=2:v=1:a=0[outv]"));
         assert!(!g.contains("asplit"));
+    }
+
+    #[test]
+    fn picture_stays_with_the_sound_over_many_cuts() {
+        // 100 pieces of 0.05 s at 30 fps: 1.5 frames each. Rounded one by one
+        // that is 200 frames (6.67 s) for 5 s of sound.
+        let kept: Vec<Range> = (0..100).map(|i| Range::new(i as f64, i as f64 + 0.05)).collect();
+        let frames = piece_frames(&kept, 30.0);
+        assert_eq!(frames.iter().sum::<u64>(), 150);
+        let mut shown = 0;
+        for (i, n) in frames.iter().enumerate() {
+            shown += n;
+            let sound = (i + 1) as f64 * 0.05;
+            assert!((shown as f64 / 30.0 - sound).abs() <= 0.5 / 30.0 + 1e-9, "piece {i}");
+        }
+        // A piece shorter than a frame can get none.
+        assert!(frames.contains(&1) && frames.contains(&2));
+        assert_eq!(piece_frames(&[Range::new(0.0, 0.01), Range::new(1.0, 2.0)], 30.0), vec![0, 30]);
     }
 
     #[test]
@@ -317,6 +412,24 @@ mod tests {
         p.set_camera(Range::new(15.0, 18.0), CameraMode::Pip);
         p.add_cut(Range::new(18.5, 19.5));
         p.overlays.push(Overlay { start: 0.5, end: 1.5, text: "Hello: it's 100%".into(), x: 0.5, y: 0.5, size: 0.1, color: [255, 255, 0] });
+        // A re-recorded range over the last cut, as a take of its kept length.
+        ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=1000:duration=2", &path("take.flac")]);
+        let pieces = p.kept_pieces(Range::new(17.0, 20.0)).into_iter().map(|(r, _)| r).collect();
+        p.add_voiceover(crate::project::Voiceover {
+            start: 17.0,
+            end: 20.0,
+            file: "take.flac".into(),
+            pieces,
+            stale_length: None,
+            words: vec![],
+        });
+        assert_eq!(p.voiceover_problem(&p.voiceovers[0]), None);
+        let small = dir.join("small.mp4");
+        preview_clip(&p, Range::new(17.0, 20.0), 320, &small, |_| {}).unwrap();
+        let info = crate::media::probe(&small).unwrap();
+        assert!((info.duration - 2.0).abs() < 0.15, "preview clip duration {}", info.duration);
+        assert_eq!(info.width, 320);
+        assert!(!info.has_audio, "the picture to speak over is silent");
         let out = dir.join("out.mp4");
         let mut last = 0.0;
         export(&p, &out, |f| last = f).unwrap();
