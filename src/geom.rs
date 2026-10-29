@@ -29,6 +29,9 @@ pub struct Window {
     pub app_id: String,
     pub area: Area,
     pub visible: bool,
+    /// The compositor's handle for sharing just this window through the
+    /// portal (sway >= 1.12), if it has one.
+    pub toplevel: Option<String>,
 }
 
 impl Window {

@@ -13,6 +13,7 @@ cargo run --release -- video.mkv --script out.md    # write the edited transcrip
 cargo run --release -- video.mkv --check            # validate video.edit.toml (after editing it by hand)
 cargo run --release -- video.mkv --transcribe       # (re)write video.transcript.json/.txt, no window;
                                                     # works on any video, e.g. an export, without an edit file
+cargo run --release -- --setup-window-capture       # sway: let scribecut pick what the portal shares
 ```
 
 On macOS, record through an app bundle instead — see [macOS](#macos) below.
@@ -75,22 +76,25 @@ notifications — turn on Do Not Disturb yourself before recording.
 
 Pick what to record:
 
-- **Full screen** – choose a monitor in the system's sharing dialog (Linux) or in
-  scribecut's own list when more than one is attached (macOS).
-- **Window** – where the screen-sharing portal can share single windows (GNOME, KDE,
-  sway ≥ 1.12), its own picker is used and the recording follows the window, whatever
-  covers it or whichever desktop you are on. Where it cannot — sway 1.11, and macOS, whose
-  AVFoundation only hands out whole displays — scribecut lists the open windows (browsers
-  first, filterable by title, or click one on screen on sway), brings the chosen one to the
-  front and records the monitor cropped to it. Keep it in place; the recording pauses
+- **Full screen** – with one monitor it is simply recorded. With several, scribecut lists
+  them (macOS, and sway with scribecut's portal chooser, below) or the system's sharing
+  dialog asks (other Linux desktops).
+- **Window** – on sway scribecut lists the open windows (browsers first, filterable by
+  title, or click one on screen). With sway ≥ 1.12 and scribecut's portal chooser the chosen
+  window is recorded on its own: windows on top of it don't show, it can be on another
+  workspace, and resizing it keeps the video's size (it is scaled to fit). On GNOME and KDE
+  the portal's own window picker is used, with the same result. Otherwise — sway 1.11, sway
+  without the chooser, and macOS, whose AVFoundation only hands out whole displays —
+  scribecut brings the chosen window to the front and records the monitor cropped to it.
+  Keep it in place; the recording pauses
   automatically while the window is not visible and resumes when it is. On macOS the
   window's *application* is brought forward, since raising one particular window of another
   app needs Accessibility permission, so put the right window in front yourself first.
 - **Region** – drag out a rectangle. On Linux this uses `slurp`; on macOS scribecut dims
   the screen and you drag on it directly (the menu bar stays on top, so start below it).
 
-For window and region recordings the monitor choice is remembered on Linux, so the portal
-dialog usually only appears once. dunst notifications are paused while recording and
+Without the chooser, the monitor choice is remembered on Linux, so the portal dialog
+usually only appears once. dunst notifications are paused while recording and
 restored afterwards; macOS has no equivalent, so turn on Do Not Disturb yourself.
 
 Options on the home screen (saved in `~/.config/scribecut/settings.toml`):
@@ -105,14 +109,16 @@ Options on the home screen (saved in `~/.config/scribecut/settings.toml`):
   theirs. macOS only has a global accessibility setting that needs apps restarted, so the
   option is hidden there.
 
-On sway ≥ 1.12, xdg-desktop-portal-wlr's default picker only offers monitors. To pick
-windows, use a dmenu-style chooser in `~/.config/xdg-desktop-portal-wlr/config`:
+### Portal chooser (sway)
 
-```ini
-[screencast]
-chooser_type=dmenu
-chooser_cmd=rofi -dmenu -p Share
-```
+xdg-desktop-portal-wlr asks a chooser command which monitor or window to share; its default
+(`slurp`, the crosshair) can only pick monitors. `scribecut --setup-window-capture`, or
+"Record windows on their own…" on the home screen, installs a chooser that answers with
+what you picked in scribecut and falls back to the usual crosshair for every other app. It
+writes `~/.local/share/scribecut/portal-chooser` and
+`~/.config/xdg-desktop-portal-wlr/config`, then restarts the portal, which ends any screen
+share in progress. An existing portal config is left alone; the command prints the two
+lines to add to it instead.
 
 Then Pause / Resume as often as you like → Stop & edit. Each piece is saved to
 `~/Videos/scribecut/<timestamp>/` (`~/Movies/scribecut/...` on macOS), joined into

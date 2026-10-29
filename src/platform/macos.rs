@@ -107,6 +107,7 @@ pub fn windows() -> Result<Vec<Window>> {
             // current Space, so everything listed is visible.
             visible: true,
             area,
+            toplevel: None,
         });
     }
     // An app often has several layer-0 windows stacked exactly on top of each

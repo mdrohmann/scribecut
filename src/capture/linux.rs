@@ -14,6 +14,7 @@ use ashpd::enumflags2::BitFlags;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use gst::prelude::*;
 
+use super::chooser::{self, Choice};
 use super::{Source, join_pieces};
 use crate::geom::{Crop, Output};
 use crate::platform;
@@ -122,11 +123,14 @@ impl Portal {
 pub struct Connection {
     portal: Portal,
     crop: Option<Crop>,
+    /// Keep the frame size the stream starts with: a shared window can be
+    /// resized while recording, and the file needs one size throughout.
+    fixed_size: bool,
     /// Sway window whose visibility pauses/resumes the recording.
     watch: Option<i64>,
 }
 
-/// Whether the portal can share individual windows (not on sway 1.11).
+/// Whether the portal can share individual windows (sway >= 1.12).
 pub fn supports_system_windows() -> bool {
     runtime().block_on(async {
         let Ok(proxy) = Screencast::new().await else { return false };
@@ -145,13 +149,31 @@ pub fn camera_available(device: &str) -> bool {
     !device.is_empty() && Path::new(device).exists()
 }
 
-/// Opens the screen stream for `source`. Blocks on the portal dialog.
+/// Opens the screen stream for `source`. Blocks on the portal dialog, unless
+/// scribecut's chooser answers it.
 pub fn connect(source: Source) -> Result<Connection> {
-    let plain = |portal| Connection { portal, crop: None, watch: None };
+    let plain = |portal| Connection { portal, crop: None, fixed_size: false, watch: None };
     match source {
-        Source::Monitor(_) => Ok(plain(Portal::open(SourceType::Monitor, None)?.0)),
+        Source::Monitor(output) => {
+            // With a single monitor there is nothing to choose.
+            let output = output.or_else(|| match platform::outputs() {
+                Ok(outputs) if outputs.len() == 1 => outputs.into_iter().next(),
+                _ => None,
+            });
+            match output {
+                Some(output) => Ok(plain(open_monitor(&output)?)),
+                None => Ok(plain(Portal::open(SourceType::Monitor, None)?.0)),
+            }
+        }
         Source::SystemWindow => Ok(plain(Portal::open(SourceType::Window, None)?.0)),
-        Source::Window { id, pid } => {
+        Source::Window { id, pid, toplevel } => {
+            if let Some(toplevel) = toplevel.filter(|_| chooser::installed() && supports_system_windows()) {
+                // Shared on its own: other windows on top don't show, and it
+                // keeps recording on another workspace.
+                let _choice = chooser::choose(Choice::Window(&toplevel))?;
+                let (portal, _) = Portal::open(SourceType::Window, None)?;
+                return Ok(Connection { portal, crop: None, fixed_size: true, watch: None });
+            }
             // Bring it to the front, record its area, and let the watcher pause
             // the recording whenever it stops being visible.
             let area = platform::focus_window(id, pid)?;
@@ -160,27 +182,37 @@ pub fn connect(source: Source) -> Result<Connection> {
         Source::Area(area) => {
             let outputs = platform::outputs()?;
             let output = platform::output_for(&area, &outputs).context("that area is not on any monitor")?;
-            // Reuse the last monitor choice so the user isn't asked again; ask
-            // if it was a different monitor than the one the area is on.
-            let token_file = dirs::data_dir().map(|d| d.join("scribecut/portal_token"));
-            let saved = token_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
-            let mut attempt = Portal::open(SourceType::Monitor, saved)?;
-            if !attempt.0.shows(&output) {
-                drop(attempt);
-                attempt = Portal::open(SourceType::Monitor, None)?;
-                if !attempt.0.shows(&output) {
-                    bail!("please pick monitor {} in the dialog - the area is on it", output.name);
-                }
-            }
-            let (portal, token) = attempt;
-            if let (Some(file), Some(token)) = (token_file, token) {
-                let _ = std::fs::create_dir_all(file.parent().unwrap());
-                let _ = std::fs::write(file, token);
-            }
+            let portal = open_monitor(&output)?;
             let crop = platform::crop_for(&area, &output);
-            Ok(Connection { portal, crop: (!crop.is_none()).then_some(crop), watch: None })
+            Ok(Connection { portal, crop: (!crop.is_none()).then_some(crop), fixed_size: false, watch: None })
         }
     }
+}
+
+/// Shares `output` without asking where possible: scribecut's chooser names
+/// it, or the portal reuses the choice saved from the last time. Asks if it
+/// was a different monitor.
+fn open_monitor(output: &Output) -> Result<Portal> {
+    if chooser::installed() {
+        let _choice = chooser::choose(Choice::Monitor(&output.name))?;
+        return Ok(Portal::open(SourceType::Monitor, None)?.0);
+    }
+    let token_file = dirs::data_dir().map(|d| d.join("scribecut/portal_token"));
+    let saved = token_file.as_ref().and_then(|f| std::fs::read_to_string(f).ok());
+    let mut attempt = Portal::open(SourceType::Monitor, saved)?;
+    if !attempt.0.shows(output) {
+        drop(attempt);
+        attempt = Portal::open(SourceType::Monitor, None)?;
+        if !attempt.0.shows(output) {
+            bail!("please pick monitor {} in the dialog", output.name);
+        }
+    }
+    let (portal, token) = attempt;
+    if let (Some(file), Some(token)) = (token_file, token) {
+        let _ = std::fs::create_dir_all(file.parent().unwrap());
+        let _ = std::fs::write(file, token);
+    }
+    Ok(portal)
 }
 
 impl Drop for Portal {
@@ -445,6 +477,62 @@ impl Drop for BigPointer {
     }
 }
 
+/// The screen stream, cropped if asked, as I420 frames handed to `on_frame`.
+/// With `fixed_size` the first frame's size is kept: later frames of another
+/// size are scaled to fit, with borders.
+fn screen_pipeline(
+    portal: &Portal,
+    crop: Option<Crop>,
+    fixed_size: bool,
+    on_frame: impl Fn(gst::Sample) + Send + Sync + 'static,
+) -> Result<gst::Pipeline> {
+    // pipewiresrc's own timestamps don't line up with the pipeline clock, so
+    // run it unsynchronised and let each segment's appsrc stamp frames on arrival.
+    let fd = portal.fd.try_clone()?.into_raw_fd();
+    let crop = crop
+        .map(|c| format!("! videocrop left={} top={} right={} bottom={} ", c.left, c.top, c.right, c.bottom))
+        .unwrap_or_default();
+    let screen = gst::parse::launch(&format!(
+        "pipewiresrc fd={fd} path={} keepalive-time=500 {crop}! videoconvert ! videoscale add-borders=true \
+         ! capsfilter name=fit ! video/x-raw,format=I420 ! appsink name=frames sync=false max-buffers=4 drop=true",
+        portal.node_id
+    ))?
+    .downcast::<gst::Pipeline>()
+    .map_err(|_| anyhow!("not a pipeline"))?;
+    screen.use_clock(None::<&gst::Clock>);
+    let sink = screen
+        .by_name("frames")
+        .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+        .context("no appsink")?;
+    let fit = screen.by_name("fit").context("no capsfilter")?;
+    let mut sized = !fixed_size;
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if !sized {
+                    // Fix the size (even, for the encoder) and drop this frame:
+                    // the next one arrives at that size.
+                    let info = sample.caps().and_then(|c| gst_video::VideoInfo::from_caps(c).ok());
+                    if let Some(info) = info {
+                        let caps = gst::Caps::builder("video/x-raw")
+                            .field("width", (info.width() & !1) as i32)
+                            .field("height", (info.height() & !1) as i32)
+                            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+                            .build();
+                        fit.set_property("caps", &caps);
+                        sized = true;
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+                }
+                on_frame(sample);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+    Ok(screen)
+}
+
 pub struct Recorder {
     // Field order matters for drop: stop watching before tearing down.
     watcher: Option<Watcher>,
@@ -459,38 +547,14 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn new(conn: Connection, dir: PathBuf, settings: &Settings) -> Result<Self> {
-        let Connection { portal, crop, watch } = conn;
-        // pipewiresrc's own timestamps don't line up with the pipeline clock, so
-        // run it unsynchronised and let each segment's appsrc stamp frames on arrival.
-        let fd = portal.fd.try_clone()?.into_raw_fd();
-        let crop = crop
-            .map(|c| format!("! videocrop left={} top={} right={} bottom={} ", c.left, c.top, c.right, c.bottom))
-            .unwrap_or_default();
-        let screen = gst::parse::launch(&format!(
-            "pipewiresrc fd={fd} path={} keepalive-time=500 {crop}! videoconvert ! video/x-raw,format=I420 \
-             ! appsink name=frames sync=false max-buffers=4 drop=true",
-            portal.node_id
-        ))?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| anyhow!("not a pipeline"))?;
-        screen.use_clock(None::<&gst::Clock>);
-        let sink = screen
-            .by_name("frames")
-            .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
-            .context("no appsink")?;
+        let Connection { portal, crop, fixed_size, watch } = conn;
         let target: Target = Arc::default();
         let forward = target.clone();
-        sink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    let mut sink = forward.lock().unwrap();
-                    sink.push(&sample);
-                    sink.last = Some(sample);
-                    Ok(gst::FlowSuccess::Ok)
-                })
-                .build(),
-        );
+        let screen = screen_pipeline(&portal, crop, fixed_size, move |sample| {
+            let mut sink = forward.lock().unwrap();
+            sink.push(&sample);
+            sink.last = Some(sample);
+        })?;
         screen.set_state(gst::State::Playing).context("connecting to the screen stream")?;
         let segments = Arc::new(Mutex::new(Segments {
             target,
@@ -598,3 +662,66 @@ impl Recorder {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shares one window through scribecut's portal chooser and checks that
+    /// every frame keeps the first frame's size while the window is resized.
+    /// Needs sway >= 1.12 with the chooser installed. Set
+    /// `SCRIBECUT_TEST_TOPLEVEL` to the window's `foreign_toplevel_identifier`,
+    /// `SCRIBECUT_TEST_RESIZE` to a sway command that resizes it, and
+    /// `SCRIBECUT_TEST_OUT` to a file for the last frame (raw I420). Run with
+    /// `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn shares_a_single_window() {
+        gst::init().unwrap();
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let conn = connect(Source::Window { id: 0, pid: 0, toplevel: Some(var("SCRIBECUT_TEST_TOPLEVEL")) }).unwrap();
+        assert!(conn.crop.is_none() && conn.watch.is_none() && conn.fixed_size, "shared on its own, not cropped");
+        let frames: Arc<Mutex<Vec<gst::Sample>>> = Arc::default();
+        let seen = frames.clone();
+        let screen = screen_pipeline(&conn.portal, None, true, move |s| seen.lock().unwrap().push(s)).unwrap();
+        screen.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        let before = frames.lock().unwrap().len();
+        assert!(Command::new("swaymsg").arg(var("SCRIBECUT_TEST_RESIZE")).status().unwrap().success());
+        std::thread::sleep(Duration::from_millis(1500));
+        screen.set_state(gst::State::Null).unwrap();
+        let frames = frames.lock().unwrap();
+        let size = |s: &gst::Sample| {
+            let info = gst_video::VideoInfo::from_caps(s.caps().unwrap()).unwrap();
+            (info.width(), info.height())
+        };
+        let first = size(&frames[0]);
+        eprintln!("{} frames ({before} before the resize), all {first:?}", frames.len());
+        assert!(before > 10 && frames.len() > before + 10, "frames keep coming");
+        assert!(frames.iter().all(|f| size(f) == first), "one size throughout");
+        let last = frames.last().unwrap().buffer().unwrap().map_readable().unwrap();
+        std::fs::write(var("SCRIBECUT_TEST_OUT"), last.as_slice()).unwrap();
+    }
+
+    /// Shares the whole screen without the portal asking which monitor (one
+    /// monitor connected, or scribecut's chooser installed). Only counts
+    /// frames. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn shares_the_monitor_without_asking() {
+        gst::init().unwrap();
+        let started = Instant::now();
+        let conn = connect(Source::Monitor(None)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "the portal asked");
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let screen = screen_pipeline(&conn.portal, None, false, move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+        .unwrap();
+        screen.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        screen.set_state(gst::State::Null).unwrap();
+        assert!(count.load(std::sync::atomic::Ordering::Relaxed) > 0, "no frames");
+    }
+}

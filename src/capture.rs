@@ -17,6 +17,8 @@ mod macos;
 use macos as backend;
 
 #[cfg(target_os = "linux")]
+pub mod chooser;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as backend;
@@ -37,9 +39,10 @@ pub enum Source {
     SystemWindow,
     /// A rectangle of the screen, recorded by cropping the monitor it is on.
     Area(Area),
-    /// A window listed by [`crate::platform`]: brought to the front, then
-    /// recorded like an area, pausing automatically while it isn't visible.
-    Window { id: i64, pid: i32 },
+    /// A window listed by [`crate::platform`]. Shared on its own through the
+    /// portal where [`records_windows_directly`]; otherwise brought to the
+    /// front and recorded like an area, pausing while it isn't visible.
+    Window { id: i64, pid: i32, toplevel: Option<String> },
 }
 
 /// Whether the system itself can offer a single-window picker (the portal on
@@ -49,8 +52,35 @@ pub fn supports_system_windows() -> bool {
 }
 
 /// Whether the system puts up its own "which screen?" dialog when a capture
-/// starts, as the portal does. Where it does not, scribecut has to ask first.
-pub const SYSTEM_MONITOR_PICKER: bool = cfg!(target_os = "linux");
+/// starts, as the portal does unless scribecut's chooser answers it. Where it
+/// does not, scribecut has to ask first.
+pub fn system_monitor_picker() -> bool {
+    #[cfg(target_os = "linux")]
+    return !chooser::installed();
+    #[cfg(not(target_os = "linux"))]
+    return false;
+}
+
+/// Whether a window from scribecut's list can be recorded on its own (sway
+/// >= 1.12 with scribecut's portal chooser), rather than cut out of the screen.
+pub fn records_windows_directly(system_windows: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    return system_windows && crate::platform::available() && chooser::installed();
+    #[cfg(not(target_os = "linux"))]
+    return {
+        let _ = system_windows;
+        false
+    };
+}
+
+/// Whether installing scribecut's portal chooser would enable
+/// [`records_windows_directly`].
+pub fn can_set_up_window_capture(system_windows: bool) -> bool {
+    cfg!(target_os = "linux")
+        && system_windows
+        && crate::platform::available()
+        && !records_windows_directly(system_windows)
+}
 
 /// Joins the recorded pieces into one file. Returns it and the start time of
 /// each piece after the first, which the editor draws as resume points.

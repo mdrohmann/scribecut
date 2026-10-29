@@ -1,5 +1,5 @@
-//! Window and region picking on sway, where the screencast portal can only
-//! share whole monitors: we capture the monitor and crop to the chosen area.
+//! Window and region picking on sway. Regions, and windows before sway 1.12,
+//! are recorded by capturing the monitor and cropping to the chosen area.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -56,6 +56,7 @@ fn collect_windows(node: &Value, out: &mut Vec<Window>) {
                 app_id,
                 area: Area { x: rect.x + inner.x, y: rect.y + inner.y, w: inner.w, h: inner.h },
                 visible: node["visible"].as_bool().unwrap_or(false),
+                toplevel: node["foreign_toplevel_identifier"].as_str().map(str::to_owned),
             });
         }
     }

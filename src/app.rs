@@ -102,6 +102,18 @@ impl App {
             if window.clicked() {
                 self.record_window(ui.ctx());
             }
+            if crate::capture::can_set_up_window_capture(self.system_windows) {
+                let setup = ui
+                    .small_button("Record windows on their own…")
+                    .on_hover_text(
+                        "Lets scribecut tell the screen-share portal which window to record, so windows on top \
+                         don't show. Writes the portal's config and restarts it, which ends any screen share \
+                         in progress (e.g. in a call). Other apps keep the usual screen picker.",
+                    );
+                if setup.clicked() {
+                    self.set_up_window_capture();
+                }
+            }
             ui.add_space(4.0);
             let can_region = platform::region_picker() != RegionPicker::None;
             let region = ui
@@ -143,7 +155,7 @@ impl App {
 
     /// Records a whole display, asking which one if the system will not.
     fn record_screen(&mut self, ctx: &egui::Context) {
-        if crate::capture::SYSTEM_MONITOR_PICKER {
+        if crate::capture::system_monitor_picker() {
             self.start(ctx, || Ok(Some(Source::Monitor(None))));
             return;
         }
@@ -154,10 +166,10 @@ impl App {
     }
 
     fn record_window(&mut self, ctx: &egui::Context) {
-        // Real window capture follows the window across desktops and past
-        // anything covering it, so it wins wherever the system offers it (sway
-        // >= 1.12, GNOME, KDE); otherwise list the windows and crop the screen.
-        if !self.system_windows && platform::available() {
+        // On sway scribecut lists the windows itself: a chosen window is then
+        // shared on its own where possible (see `connect`), or cut out of the
+        // screen. Elsewhere the system's own window picker is used (GNOME, KDE).
+        if platform::available() {
             match platform::windows() {
                 Ok(windows) => self.screen = Screen::ChooseWindow { windows, filter: String::new() },
                 Err(e) => self.report(format!("Could not list windows: {e:#}")),
@@ -166,6 +178,17 @@ impl App {
             self.start(ctx, || Ok(Some(Source::SystemWindow)));
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn set_up_window_capture(&mut self) {
+        use crate::capture::chooser;
+        if let Err(e) = chooser::install().and_then(|_| chooser::restart_portal()) {
+            self.report(format!("Could not set up window recording: {e:#}"));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn set_up_window_capture(&mut self) {}
 
     fn record_region(&mut self, ctx: &egui::Context) {
         match platform::region_picker() {
@@ -266,9 +289,11 @@ impl App {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
             ui.heading("Record a window");
-            ui.weak(
-                "The recording is cut out of the screen: keep the window in place and uncovered while recording.",
-            );
+            ui.weak(if crate::capture::records_windows_directly(self.system_windows) {
+                "Only this window is recorded: windows on top of it don't show, and it can be on another workspace."
+            } else {
+                "The recording is cut out of the screen: keep the window in place and uncovered while recording."
+            });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space((ui.available_width() - 520.0).max(0.0) / 2.0);
@@ -304,20 +329,21 @@ impl App {
                         text.append("   (other workspace)", 0.0, fmt(weak));
                     }
                     if ui.add_sized([640.0, 30.0], egui::Button::new(text).truncate()).clicked() {
-                        chosen = Some((w.id, w.pid));
+                        chosen = Some((w.id, w.pid, w.toplevel.clone()));
                     }
                 }
             });
         });
-        if let Some((id, pid)) = chosen {
-            self.start(ui.ctx(), move || Ok(Some(Source::Window { id, pid })));
+        if let Some((id, pid, toplevel)) = chosen {
+            self.start(ui.ctx(), move || Ok(Some(Source::Window { id, pid, toplevel })));
         } else if click {
             let windows = windows.to_vec();
             self.start(ui.ctx(), move || {
                 // The picker reports which window was clicked; its process is
                 // what brings the application forward.
                 Ok(platform::click_window(&windows)?.and_then(|id| {
-                    windows.iter().find(|w| w.id == id).map(|w| Source::Window { id, pid: w.pid })
+                    let w = windows.iter().find(|w| w.id == id)?;
+                    Some(Source::Window { id, pid: w.pid, toplevel: w.toplevel.clone() })
                 }))
             });
         }

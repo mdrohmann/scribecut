@@ -179,7 +179,7 @@ pub fn connect(source: Source) -> Result<Connection> {
             (output, None, None)
         }
         Source::SystemWindow => bail!("macOS has no system window picker; pick the window from the list"),
-        Source::Window { id, pid } => {
+        Source::Window { id, pid, .. } => {
             // Bring it to the front, then record its area, watching it so the
             // recording pauses whenever it stops being visible.
             let area = platform::focus_window(id, pid)?;

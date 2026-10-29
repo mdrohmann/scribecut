@@ -74,6 +74,21 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    // `scribecut --setup-window-capture` points the sway screencast portal at
+    // scribecut's chooser (see `capture::chooser`) and restarts the portal.
+    #[cfg(target_os = "linux")]
+    if let [flag] = args.as_slice()
+        && flag.as_os_str() == "--setup-window-capture"
+    {
+        match capture::chooser::install().and_then(|config| capture::chooser::restart_portal().map(|_| config)) {
+            Ok(config) => println!("portal set up ({}) and restarted", config.display()),
+            Err(e) => {
+                eprintln!("setup failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     // Optional: a video or project file to open straight away.
     let open = args.first().cloned();
     let options = eframe::NativeOptions {
