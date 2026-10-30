@@ -82,7 +82,11 @@ Pick what to record:
 - **Window** – on sway scribecut lists the open windows (browsers first, filterable by
   title, or click one on screen). With sway ≥ 1.12 and scribecut's portal chooser the chosen
   window is recorded on its own: windows on top of it don't show, it can be on another
-  workspace, and resizing it keeps the video's size (it is scaled to fit). On GNOME and KDE
+  workspace, and resizing it keeps the video's size (it is scaled to fit). Chrome and some
+  other apps stop drawing windows you can't see, though, so keep the window in view; the
+  recording screen warns when no picture arrives. xdg-desktop-portal-wlr 0.8.4 can crash
+  while sharing a Chrome window ([#404](https://github.com/emersion/xdg-desktop-portal-wlr/issues/404));
+  scribecut then carries on recording the window cut out of the screen. On GNOME and KDE
   the portal's own window picker is used, with the same result. Otherwise — sway 1.11, sway
   without the chooser, and macOS, whose AVFoundation only hands out whole displays —
   scribecut brings the chosen window to the front and records the monitor cropped to it.

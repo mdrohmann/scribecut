@@ -368,12 +368,14 @@ impl App {
                     .monospace(),
             );
             ui.label(format!("{} piece(s) · {}", rec.pieces(), rec.dir().display()));
+            let warning = rec.warning();
             if rec.has_camera() {
                 ui.label("Camera: recording");
-            } else if let Some(warning) = rec.warning() {
-                ui.colored_label(Color32::from_rgb(230, 180, 40), warning);
-            } else {
+            } else if warning.is_none() {
                 ui.weak("Camera: off (turn on \"Record camera\" on the home screen)");
+            }
+            if let Some(warning) = warning {
+                ui.colored_label(Color32::from_rgb(230, 180, 40), warning);
             }
             if rec.is_waiting_for_window() {
                 ui.colored_label(

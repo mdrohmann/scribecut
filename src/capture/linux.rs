@@ -123,9 +123,11 @@ impl Portal {
 pub struct Connection {
     portal: Portal,
     crop: Option<Crop>,
-    /// Keep the frame size the stream starts with: a shared window can be
-    /// resized while recording, and the file needs one size throughout.
-    fixed_size: bool,
+    /// The window being shared on its own (sway container id and pid): its
+    /// frame size is kept from the start, since it can be resized while
+    /// recording and the file needs one size throughout, and if the portal
+    /// dies the window is recorded cut out of the screen instead.
+    window: Option<(i64, i32)>,
     /// Sway window whose visibility pauses/resumes the recording.
     watch: Option<i64>,
 }
@@ -152,7 +154,7 @@ pub fn camera_available(device: &str) -> bool {
 /// Opens the screen stream for `source`. Blocks on the portal dialog, unless
 /// scribecut's chooser answers it.
 pub fn connect(source: Source) -> Result<Connection> {
-    let plain = |portal| Connection { portal, crop: None, fixed_size: false, watch: None };
+    let plain = |portal| Connection { portal, crop: None, window: None, watch: None };
     match source {
         Source::Monitor(output) => {
             // With a single monitor there is nothing to choose.
@@ -172,7 +174,7 @@ pub fn connect(source: Source) -> Result<Connection> {
                 // keeps recording on another workspace.
                 let _choice = chooser::choose(Choice::Window(&toplevel))?;
                 let (portal, _) = Portal::open(SourceType::Window, None)?;
-                return Ok(Connection { portal, crop: None, fixed_size: true, watch: None });
+                return Ok(Connection { portal, crop: None, window: Some((id, pid)), watch: None });
             }
             // Bring it to the front, record its area, and let the watcher pause
             // the recording whenever it stops being visible.
@@ -184,7 +186,7 @@ pub fn connect(source: Source) -> Result<Connection> {
             let output = platform::output_for(&area, &outputs).context("that area is not on any monitor")?;
             let portal = open_monitor(&output)?;
             let crop = platform::crop_for(&area, &output);
-            Ok(Connection { portal, crop: (!crop.is_none()).then_some(crop), fixed_size: false, watch: None })
+            Ok(Connection { portal, crop: (!crop.is_none()).then_some(crop), window: None, watch: None })
         }
     }
 }
@@ -236,10 +238,12 @@ const VIDEO_ENCODE: &str = "videorate ! video/x-raw,framerate=30/1 \
 struct FrameSink {
     src: Option<gst_app::AppSrc>,
     last: Option<gst::Sample>,
+    /// Whether the current segment has had a frame yet.
+    delivered: bool,
 }
 
 impl FrameSink {
-    fn push(&self, sample: &gst::Sample) {
+    fn push(&mut self, sample: &gst::Sample) {
         let (Some(src), Some(caps), Some(buffer)) = (&self.src, sample.caps(), sample.buffer_owned()) else { return };
         let caps = caps.to_owned();
         if src.caps().as_ref() != Some(&caps) {
@@ -251,11 +255,12 @@ impl FrameSink {
         b.set_pts(gst::ClockTime::NONE);
         b.set_dts(gst::ClockTime::NONE);
         b.set_duration(gst::ClockTime::NONE);
-        let _ = src.push_buffer(buffer);
+        self.delivered |= src.push_buffer(buffer).is_ok();
     }
 
     fn start(&mut self, src: gst_app::AppSrc) {
         self.src = Some(src);
+        self.delivered = false;
         if let Some(last) = self.last.clone() {
             self.push(&last);
         }
@@ -356,7 +361,22 @@ impl Segments {
     fn stop(&mut self) -> Result<()> {
         let Some((pipeline, started)) = self.current.take() else { return Ok(()) };
         self.recorded += started.elapsed();
-        self.target.lock().unwrap().src = None;
+        let delivered = {
+            let mut target = self.target.lock().unwrap();
+            target.src = None;
+            target.delivered
+        };
+        if !delivered {
+            // No screen frame yet (a shared window that hasn't drawn since):
+            // the muxer never started, the microphone is stuck pushing into a
+            // full queue, and an EOS would wait on it forever. Nothing worth
+            // keeping was recorded, so drop the piece.
+            pipeline.set_state(gst::State::Null)?;
+            if let Some(file) = self.files.pop() {
+                let _ = std::fs::remove_file(file);
+            }
+            return Ok(());
+        }
         pipeline.send_event(gst::event::Eos::new());
         let bus = pipeline.bus().context("no bus")?;
         let result = match bus.timed_pop_filtered(
@@ -477,13 +497,17 @@ impl Drop for BigPointer {
     }
 }
 
+/// A frame size shared between screen pipelines: set by the first frame, then
+/// kept by every pipeline that replaces it.
+type FixedSize = Arc<Mutex<Option<(i32, i32)>>>;
+
 /// The screen stream, cropped if asked, as I420 frames handed to `on_frame`.
-/// With `fixed_size` the first frame's size is kept: later frames of another
-/// size are scaled to fit, with borders.
+/// With `fixed` frames keep that size, or the first frame's if it is not set
+/// yet: frames of another size are scaled to fit, with borders.
 fn screen_pipeline(
     portal: &Portal,
     crop: Option<Crop>,
-    fixed_size: bool,
+    fixed: Option<FixedSize>,
     on_frame: impl Fn(gst::Sample) + Send + Sync + 'static,
 ) -> Result<gst::Pipeline> {
     // pipewiresrc's own timestamps don't line up with the pipeline clock, so
@@ -505,23 +529,32 @@ fn screen_pipeline(
         .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
         .context("no appsink")?;
     let fit = screen.by_name("fit").context("no capsfilter")?;
-    let mut sized = !fixed_size;
+    let set_size = move |(w, h): (i32, i32)| {
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("width", w)
+            .field("height", h)
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .build();
+        fit.set_property("caps", &caps);
+    };
+    let preset = fixed.as_ref().and_then(|f| *f.lock().unwrap());
+    if let Some(size) = preset {
+        set_size(size);
+    }
+    let mut to_fix = fixed.filter(|_| preset.is_none());
     sink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                if !sized {
+                if let Some(fixed) = &to_fix {
                     // Fix the size (even, for the encoder) and drop this frame:
                     // the next one arrives at that size.
                     let info = sample.caps().and_then(|c| gst_video::VideoInfo::from_caps(c).ok());
                     if let Some(info) = info {
-                        let caps = gst::Caps::builder("video/x-raw")
-                            .field("width", (info.width() & !1) as i32)
-                            .field("height", (info.height() & !1) as i32)
-                            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-                            .build();
-                        fit.set_property("caps", &caps);
-                        sized = true;
+                        let size = ((info.width() & !1) as i32, (info.height() & !1) as i32);
+                        *fixed.lock().unwrap() = Some(size);
+                        set_size(size);
+                        to_fix = None;
                         return Ok(gst::FlowSuccess::Ok);
                     }
                 }
@@ -533,6 +566,15 @@ fn screen_pipeline(
     Ok(screen)
 }
 
+/// Hands screen frames to the current segment, keeping the latest.
+fn forward(target: Target) -> impl Fn(gst::Sample) + Send + Sync + 'static {
+    move |sample| {
+        let mut sink = target.lock().unwrap();
+        sink.push(&sample);
+        sink.last = Some(sample);
+    }
+}
+
 pub struct Recorder {
     // Field order matters for drop: stop watching before tearing down.
     watcher: Option<Watcher>,
@@ -540,21 +582,21 @@ pub struct Recorder {
     /// Runs for the whole session, pulling frames from PipeWire.
     screen: gst::Pipeline,
     /// Kept open for the stream's lifetime; dropping it ends screen sharing.
-    _portal: Portal,
+    portal: Portal,
+    /// The window shared on its own, to fall back to cutting out of the
+    /// screen if the portal dies; and the frame size kept meanwhile.
+    window: Option<(i64, i32)>,
+    size: FixedSize,
     _quiet: Option<QuietNotifications>,
     _pointer: Option<BigPointer>,
 }
 
 impl Recorder {
     pub fn new(conn: Connection, dir: PathBuf, settings: &Settings) -> Result<Self> {
-        let Connection { portal, crop, fixed_size, watch } = conn;
+        let Connection { portal, crop, window, watch } = conn;
         let target: Target = Arc::default();
-        let forward = target.clone();
-        let screen = screen_pipeline(&portal, crop, fixed_size, move |sample| {
-            let mut sink = forward.lock().unwrap();
-            sink.push(&sample);
-            sink.last = Some(sample);
-        })?;
+        let size = FixedSize::default();
+        let screen = screen_pipeline(&portal, crop, window.map(|_| size.clone()), forward(target.clone()))?;
         screen.set_state(gst::State::Playing).context("connecting to the screen stream")?;
         let segments = Arc::new(Mutex::new(Segments {
             target,
@@ -572,7 +614,9 @@ impl Recorder {
             watcher: watch.map(|id| Watcher::spawn(id, segments.clone())),
             segments,
             screen,
-            _portal: portal,
+            portal,
+            window,
+            size,
             _quiet: QuietNotifications::new(),
             _pointer: settings.big_pointer.then(|| BigPointer::new(settings.pointer_scale)).flatten(),
         })
@@ -623,17 +667,23 @@ impl Recorder {
 
     /// A problem worth showing that doesn't stop the recording.
     pub fn warning(&self) -> Option<String> {
-        self.segments.lock().unwrap().warning.clone()
+        let s = self.segments.lock().unwrap();
+        let waiting = s.current.as_ref().is_some_and(|(_, started)| started.elapsed() > Duration::from_secs(2));
+        if waiting && !s.target.lock().unwrap().delivered {
+            return Some(
+                "No picture yet: the window hasn't drawn anything since recording started. Apps like Chrome \
+                 stop drawing windows you can't see, so bring it into view."
+                    .into(),
+            );
+        }
+        s.warning.clone()
     }
 
-    /// Checks for errors (e.g. the user stopped sharing the screen).
-    pub fn poll_error(&self) -> Option<String> {
-        let mut s = self.segments.lock().unwrap();
-        if let Some(e) = s.error.take() {
-            return Some(e);
-        }
-        let current = s.current.as_ref().map(|(p, _)| p);
-        [Some(&self.screen), current].into_iter().flatten().find_map(|p| {
+    /// Checks for errors (e.g. the user stopped sharing the screen). If the
+    /// stream of a window shared on its own fails, the window is recorded cut
+    /// out of the screen from then on, with a warning instead of an error.
+    pub fn poll_error(&mut self) -> Option<String> {
+        let error = |p: &gst::Pipeline| {
             let msg = p.bus()?.pop_filtered(&[gst::MessageType::Error])?;
             match msg.view() {
                 gst::MessageView::Error(e) => Some(format!(
@@ -643,7 +693,49 @@ impl Recorder {
                 )),
                 _ => None,
             }
-        })
+        };
+        {
+            let mut s = self.segments.lock().unwrap();
+            if let Some(e) = s.error.take() {
+                return Some(e);
+            }
+            if let Some(e) = s.current.as_ref().and_then(|(p, _)| error(p)) {
+                return Some(e);
+            }
+        }
+        let e = error(&self.screen)?;
+        let Some((id, pid)) = self.window.take() else { return Some(e) };
+        match self.cut_out_window(id, pid) {
+            Ok(()) => {
+                self.segments.lock().unwrap().warning = Some(
+                    "The screen-share portal stopped (a known portal bug with some apps, e.g. Chrome), so the \
+                     window is now recorded cut out of the screen: keep it in place and uncovered."
+                        .into(),
+                );
+                None
+            }
+            Err(cut) => Some(format!("{e}; recording the window cut out of the screen failed too: {cut:#}")),
+        }
+    }
+
+    /// Switches from sharing a window on its own to recording it cut out of
+    /// the screen, keeping the frame size. The current piece ends and a new
+    /// one starts, as after Pause / Resume.
+    fn cut_out_window(&mut self, id: i64, pid: i32) -> Result<()> {
+        let _ = self.screen.set_state(gst::State::Null);
+        let was_recording = self.is_recording();
+        self.segments.lock().unwrap().stop()?;
+        let conn = connect(Source::Window { id, pid, toplevel: None })?;
+        let target = self.segments.lock().unwrap().target.clone();
+        let screen = screen_pipeline(&conn.portal, conn.crop, Some(self.size.clone()), forward(target))?;
+        screen.set_state(gst::State::Playing).context("connecting to the screen stream")?;
+        self.screen = screen;
+        self.portal = conn.portal;
+        self.watcher = conn.watch.map(|id| Watcher::spawn(id, self.segments.clone()));
+        if was_recording {
+            self.segments.lock().unwrap().start()?;
+        }
+        Ok(())
     }
 
     /// Stops recording and joins the pieces. Returns the final file and the
@@ -680,10 +772,11 @@ mod tests {
         gst::init().unwrap();
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
         let conn = connect(Source::Window { id: 0, pid: 0, toplevel: Some(var("SCRIBECUT_TEST_TOPLEVEL")) }).unwrap();
-        assert!(conn.crop.is_none() && conn.watch.is_none() && conn.fixed_size, "shared on its own, not cropped");
+        assert!(conn.crop.is_none() && conn.watch.is_none() && conn.window.is_some(), "shared on its own, not cropped");
         let frames: Arc<Mutex<Vec<gst::Sample>>> = Arc::default();
         let seen = frames.clone();
-        let screen = screen_pipeline(&conn.portal, None, true, move |s| seen.lock().unwrap().push(s)).unwrap();
+        let fixed = Some(FixedSize::default());
+        let screen = screen_pipeline(&conn.portal, None, fixed, move |s| seen.lock().unwrap().push(s)).unwrap();
         screen.set_state(gst::State::Playing).unwrap();
         std::thread::sleep(Duration::from_millis(1500));
         let before = frames.lock().unwrap().len();
@@ -715,7 +808,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "the portal asked");
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = count.clone();
-        let screen = screen_pipeline(&conn.portal, None, false, move |_| {
+        let screen = screen_pipeline(&conn.portal, None, None, move |_| {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         })
         .unwrap();
@@ -723,5 +816,40 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
         screen.set_state(gst::State::Null).unwrap();
         assert!(count.load(std::sync::atomic::Ordering::Relaxed) > 0, "no frames");
+    }
+
+    /// Records a window shared on its own for a few seconds and kills the
+    /// portal two seconds in: the recording must carry on cut out of the
+    /// screen, with a warning, and come out at one size. Set
+    /// `SCRIBECUT_TEST_TOPLEVEL`, `SCRIBECUT_TEST_CON` (its sway container id)
+    /// and `SCRIBECUT_TEST_OUT` (an empty folder). Records the microphone and
+    /// restarts xdg-desktop-portal-wlr. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn carries_on_when_the_portal_dies() {
+        gst::init().unwrap();
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let id: i64 = var("SCRIBECUT_TEST_CON").parse().unwrap();
+        let pid = platform::windows().unwrap().into_iter().find(|w| w.id == id).unwrap().pid;
+        let conn = connect(Source::Window { id, pid, toplevel: Some(var("SCRIBECUT_TEST_TOPLEVEL")) }).unwrap();
+        let settings = Settings { record_camera: false, big_pointer: false, ..Settings::default() };
+        let mut rec = Recorder::new(conn, PathBuf::from(var("SCRIBECUT_TEST_OUT")), &settings).unwrap();
+        rec.start_segment().unwrap();
+        for i in 0..80 {
+            if i == 20 && std::env::var_os("SCRIBECUT_TEST_KEEP_PORTAL").is_none() {
+                let kill = ["--user", "kill", "-s", "KILL", "xdg-desktop-portal-wlr"];
+                assert!(Command::new("systemctl").args(kill).status().unwrap().success());
+            }
+            assert_eq!(rec.poll_error(), None);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let warning = rec.warning();
+        let pieces = rec.pieces();
+        let (file, _) = rec.finish().unwrap();
+        eprintln!("{pieces} pieces, warning: {warning:?}");
+        assert!(warning.is_some_and(|w| w.contains("cut out of the screen")), "fell back");
+        let info = crate::media::probe(&file).unwrap();
+        eprintln!("{:.1}s at {}x{}", info.duration, info.width, info.height);
+        assert!(info.duration > 6.0, "kept recording: {}", info.duration);
     }
 }
