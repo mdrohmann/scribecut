@@ -185,6 +185,9 @@ drops those stages instead of failing the export.
 | Jump to a word | Click it in the transcript |
 | Select a range | Shift+click a second word, drag on the timeline, or `I` / `O` at the playhead |
 | Fine-tune | `←` `→` one frame, `Shift+←` `Shift+→` one second |
+| Move through the video | `J` / `L` five seconds back / on, `K` pause, `Ctrl+←` `Ctrl+→` previous / next word, `↑` `↓` previous / next edit point (cut, slide, overlay, camera or re-recording edge, resume point), `Home` / `End` |
+| Preview while hovering | Hover over the timeline: a picture of the recording at that moment floats above it. Hover over the time ruler for the timeline's controls |
+| Hide cuts | "Hide cuts" / `E`: the timeline shows the edited video, cut parts shrunk to thin red marks; `E` again for the whole recording |
 | Find pauses | The blue waveform under the words shows loudness (scaled to the recording's noise floor), so gaps between words stand out; zoom in to place cut edges in them |
 | Cut | `Delete` / `X` / "Cut selection"; right-click a red cut (or "Restore") to undo it |
 | Overlay text | "+ Add overlay" (uses the selection as its time range) → text → "Place on video…" → click the spot |
@@ -193,7 +196,8 @@ drops those stages instead of failing the export.
 | Zoom / pan timeline | Mouse wheel / Shift+wheel; `C` centres the view on the playhead without changing the zoom |
 | Slides | "+ Slide…" → pick an image, PDF, presentation (.pptx/.odp/.key, converted with LibreOffice) or video clip; it replaces the screen recording for the selection. Set the page (or the clip's start) in the dialog; click its purple bar to edit |
 | Camera | "Camera" menu → for the selection: Only me / Small window / Hide me; also the layout everywhere else and the small window's corner. Right-click an outlined range on the camera strip to remove it |
-| Re-record audio | Select a range → "Re-record audio…". The edited video of the selection (cuts skipped, slides, camera and text shown) plays without sound after a 3-second countdown while you speak; recording stops by itself at the end (or "Stop early"). What is said there now is shown to read from. The take replaces the recording's sound in that range, its words replace the transcript's, and it is saved as `voiceovers/take-N.flac`. A purple band on the waveform marks it; remove it in the "Re-recorded audio" list. Cuts made inside the range afterwards remove narration and picture together, so you can trim pauses and slips from a take; restoring a cut it was recorded around leaves that part without narration (marked in red) |
+| Camera background | "Background" menu: the room as recorded, the room blurred, or a picture; `B` steps through them. The preview cuts you out live (a little behind and rougher than the export) |
+| Re-record audio | Select a range → "Re-record audio…". The edited video of the selection (cuts skipped, slides, camera and text shown) plays without sound after a 3-second countdown while you speak; recording stops by itself at the end (or "Stop early"). What is said there now is shown to read from. The take replaces the recording's sound in that range, its words replace the transcript's, and it is saved as `voiceovers/take-N.flac`. A purple band on the waveform marks it. Earlier takes over the same stretch are kept: the "Re-recorded audio" list has a choice per stretch, "original" (the recording's own sound) or any take, and the band names the take in use and how many versions there are. Cuts made inside the range afterwards remove narration and picture together, so you can trim pauses and slips from a take; restoring a cut it was recorded around leaves that part without narration (marked in red) |
 | Export | "Export…" → MP4 (H.264/AAC) |
 | Script | "Export script…" → Markdown of the transcript after cuts: paragraphs at pauses with their time in the edited video, `---` between recorded pieces, `[On screen: …]` notes for overlays. Handy as a script for re-recording |
 
@@ -201,6 +205,14 @@ Playback skips cuts and shows slides, camera and overlays, so the preview matche
 sound plays straight through with the cuts already removed and the picture follows it, so a cut
 never interrupts the sound
 (layering: screen < slide < camera < text).
+
+**Camera background.** `background = "blur"` or `background = "office.jpg"` in the edit file's
+`[camera]` section replaces the room behind you in the export (the "Background" menu or `B` in the editor). A
+portrait-matting model (MODNet, about 25 MB, downloaded on first use) cuts you out of the camera
+picture, only where the camera is on screen. That takes a while on the first export, roughly
+5 seconds per second of camera shown; the result is cached in `.scribecut-cache/` and reused until
+the cuts or camera ranges change. The blur is made from the room alone, so it leaves no
+shadow of you behind your outline.
 
 ## Editing with text files (or an agent)
 
@@ -261,3 +273,4 @@ when you use `cargo test`, which is separate from the app bundle's own permissio
 | `transcribe` | whisper.cpp with word timestamps |
 | `project` | The edit model (saved by `edit_file` as `.edit.toml`) |
 | `voiceover` | Re-recorded narration: the microphone take and splicing takes into the sound |
+| `cutout` | Cutting the person out of the camera picture (MODNet via ONNX Runtime): mattes for the export, live for the preview |

@@ -12,6 +12,8 @@ egui = "0.36.2"
 gst = { package = "gstreamer", version = "0.25.4" }
 gst-app = { package = "gstreamer-app", version = "0.25.2" }
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
+# ONNX Runtime, linked in statically: runs the person-cutout model (see src/cutout.rs).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }

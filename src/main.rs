@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod capture;
+mod cutout;
 mod edit_file;
 mod editor;
 mod export;

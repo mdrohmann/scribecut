@@ -1,6 +1,5 @@
 //! Local speech-to-text with word timestamps via whisper.cpp.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -31,26 +30,7 @@ pub fn ensure_model(mut status: impl FnMut(Status)) -> Result<PathBuf> {
         return Ok(path);
     }
     let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
-    let mut resp = ureq::get(&url).call().with_context(|| format!("downloading {url}"))?;
-    let total = resp.body().content_length().unwrap_or(0);
-    let part = path.with_extension("part");
-    let mut out = std::fs::File::create(&part)?;
-    let mut reader = resp.body_mut().as_reader();
-    let mut buf = vec![0u8; 1 << 16];
-    let mut done = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-        done += n as u64;
-        if total > 0 {
-            status(Status::Downloading(done as f32 / total as f32));
-        }
-    }
-    out.sync_all()?;
-    std::fs::rename(&part, &path)?;
+    crate::media::download(&url, &path, |f| status(Status::Downloading(f)))?;
     Ok(path)
 }
 
@@ -112,7 +92,58 @@ pub fn transcribe(media: &Path, mut status: impl FnMut(Status) + Send + 'static)
         w.start = map.to_source(w.start);
         w.end = map.to_source(w.end).max(w.start);
     }
+    fit_to_speech(&mut words, &pauses(&audio));
     Ok(words)
+}
+
+/// Audio level below which a 50 ms frame counts as quiet, in dB below full scale.
+const QUIET_DB: f32 = -42.0;
+/// Shorter quiet stretches are gaps inside a word, not pauses.
+const MIN_PAUSE: f64 = 0.3;
+const FRAME: usize = SAMPLE_RATE / 20;
+
+/// The quiet stretches of the audio, as (start, end) in seconds.
+fn pauses(audio: &[f32]) -> Vec<(f64, f64)> {
+    let quiet = audio.chunks(FRAME).map(|c| {
+        let rms = (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt();
+        20.0 * (rms + 1e-9).log10() < QUIET_DB
+    });
+    let secs = |k: usize| (k * FRAME) as f64 / SAMPLE_RATE as f64;
+    let mut out = Vec::new();
+    let mut start = None;
+    for (k, q) in quiet.chain([false]).enumerate() {
+        match (q, start) {
+            (true, None) => start = Some(k),
+            (false, Some(s)) => {
+                if secs(k - s) >= MIN_PAUSE - 1e-9 {
+                    out.push((secs(s), secs(k)));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whisper stretches a word over the pause after it and starts the next word where
+/// that one ends, so a word can sit a second away from where it is heard. Each word
+/// is trimmed to its longest stretch outside the pauses; a word lying entirely in a
+/// pause keeps whisper's time, the only guess there is.
+fn fit_to_speech(words: &mut [Word], pauses: &[(f64, f64)]) {
+    for w in words {
+        let mut parts = vec![(w.start, w.end)];
+        for &(a, b) in pauses.iter().filter(|&&(a, b)| b > w.start && a < w.end) {
+            parts = parts
+                .into_iter()
+                .flat_map(|(p, q)| [(p, q.min(a)), (p.max(b), q)])
+                .filter(|(p, q)| q - p > 1e-6)
+                .collect();
+        }
+        if let Some(&(p, q)) = parts.iter().max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0))) {
+            (w.start, w.end) = (p, q);
+        }
+    }
 }
 
 /// Silence put between speech stretches in the shortened audio.
@@ -231,6 +262,23 @@ mod tests {
         // In the gap: end of the first stretch.
         assert_eq!(map.to_source(2.2), 4.0);
         assert_eq!(map.to_source(2.5 + 0.25), 10.25);
+    }
+
+    #[test]
+    fn words_are_trimmed_to_speech() {
+        use crate::project::Word;
+        let s = super::SAMPLE_RATE;
+        // Speech 0-1 s, quiet 1-3 s, speech 3-4 s, a 0.1 s dip at 3.5 s.
+        let mut audio = vec![0.3f32; 4 * s];
+        audio[s..3 * s].fill(0.0);
+        audio[7 * s / 2..7 * s / 2 + s / 10].fill(0.0);
+        let pauses = super::pauses(&audio);
+        assert_eq!(pauses, vec![(1.0, 3.0)]);
+        let word = |start, end| Word { text: "x".into(), start, end };
+        let mut words = vec![word(0.2, 2.5), word(2.5, 3.8), word(1.5, 2.0)];
+        super::fit_to_speech(&mut words, &pauses);
+        let times: Vec<_> = words.iter().map(|w| (w.start, w.end)).collect();
+        assert_eq!(times, vec![(0.2, 1.0), (3.0, 3.8), (1.5, 2.0)]);
     }
 
     #[test]

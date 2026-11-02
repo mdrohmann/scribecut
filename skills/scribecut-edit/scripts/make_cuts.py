@@ -13,8 +13,10 @@ plan.json (times on the ORIGINAL recording's timeline):
   "extra_cuts": [["^to the shared view@0:39", "^to the shared view@0:41", "repeated phrase"]],
   "slides": [{"from": 0, "to": "^So this is the view", "file": "slides.pdf", "page": 1},
              {"from": "^So the next steps@4:34", "to": "end", "file": "slides.pdf", "page": 2}],
-  "pad": 0.10,          # optional: silence left on each side of a pause cut
-  "min_pause": 0.35     # optional: shorter pauses are left alone
+  "pad": 0.20,          # optional: silence left on each side of a pause cut
+  "min_pause": 0.8,     # optional: shorter pauses are left alone
+  "min_piece": 1.5      # optional: a pause shorter than 2 s is kept rather than leave a
+                        # piece of video shorter than this between two cuts
 }
 A time is seconds (32.9), "m:ss.ss", or a phrase anchor:
   "^words"   the boundary just BEFORE the words (start of a keep, start of a cut)
@@ -59,8 +61,11 @@ def t(x):
 
 m = re.search(r'^duration\s*=\s*"([^"]+)"', base_text, re.M)
 DUR = secs_plain(m.group(1))
-PAD = plan.get("pad", 0.10)
-MIN_PAUSE = plan.get("min_pause", 0.35)
+PAD = plan.get("pad", 0.20)
+MIN_PAUSE = plan.get("min_pause", 0.8)
+MIN_PIECE = plan.get("min_piece", 1.5)
+# Pauses at least this long are always cut, even next to a short piece.
+LONG_PAUSE = 2.0
 sil = [tuple(map(float, l.split())) for l in open(sil_path) if l.strip()]
 
 words = levels = None
@@ -159,12 +164,24 @@ for (a, b, _), (c, d, _) in zip(keep, keep[1:]):
 if keep[-1][1] < DUR:
     cuts.append((keep[-1][1], DUR, "removed"))
 for a, b, _ in keep:
+    # Every cut makes the picture jump, so a cut that would leave a very short piece
+    # of video is skipped unless the pause is long: many small jumps look jittery.
+    pauses = []
     for s, e in sil:
         s, e = max(s, a), min(e, b)
         if e - s >= MIN_PAUSE and s + PAD < e - PAD:
             lo = s + PAD if s > a else s
             hi = e - PAD if e < b else e
-            cuts.append((lo, hi, "pause"))
+            pauses.append((lo, hi, e - s >= LONG_PAUSE))
+    pos = a
+    chosen = []
+    for lo, hi, long in pauses:
+        if long or lo == a or lo - pos >= MIN_PIECE:
+            chosen.append((lo, hi, long))
+            pos = hi
+    while chosen and not chosen[-1][2] and chosen[-1][1] < b and b - chosen[-1][1] < MIN_PIECE:
+        chosen.pop()
+    cuts += [(lo, hi, "pause") for lo, hi, _ in chosen]
 for a, b, n in plan.get("extra_cuts", []):
     cuts.append((secs(a), secs(b), n))
 cuts.sort()

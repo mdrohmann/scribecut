@@ -247,8 +247,76 @@ fn bundled_font() -> Option<PathBuf> {
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
+
+
+/// Width, height and the RGB pixels of each picture.
+pub type Thumbnails = (u32, u32, Vec<Vec<u8>>);
+
+/// Small pictures of the screen track every `step` seconds, `width` pixels
+/// wide: (width, height, RGB pixels per picture). For the timeline's hover preview.
+pub fn thumbnails(path: &Path, step: f64, width: u32) -> Result<Thumbnails> {
+    let info = probe(path)?;
+    let height = ((width as f64 * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+    let mut child = ffmpeg()
+        .stdin(Stdio::null())
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-vf", &format!("fps=1/{step:.3}:round=down,scale={width}:{height}")])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("running ffmpeg")?;
+    let mut bytes = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut bytes)?;
+    if !child.wait()?.success() {
+        bail!("ffmpeg thumbnails failed");
+    }
+    let size = (width * height * 3) as usize;
+    Ok((width, height, bytes.chunks_exact(size).map(<[u8]>::to_vec).collect()))
+}
+/// Downloads `url` to `path` through a `.part` file, so a broken download is
+/// never taken for a finished one. `progress` gets 0..1 when the size is known.
+pub fn download(url: &str, path: &Path, mut progress: impl FnMut(f32)) -> Result<()> {
+    use std::io::Write;
+    let mut resp = ureq::get(url).call().with_context(|| format!("downloading {url}"))?;
+    let total = resp.body().content_length().unwrap_or(0);
+    let part = path.with_extension("part");
+    let mut out = std::fs::File::create(&part)?;
+    let mut reader = resp.body_mut().as_reader();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+        done += n as u64;
+        if total > 0 {
+            progress(done as f32 / total as f32);
+        }
+    }
+    out.sync_all()?;
+    std::fs::rename(&part, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    /// `SCRIBECUT_TEST_MEDIA` = any recording: one picture per `step`, all the same size.
+    #[test]
+    #[ignore]
+    fn thumbnails_of_a_real_recording() {
+        let media = std::path::PathBuf::from(std::env::var("SCRIBECUT_TEST_MEDIA").expect("SCRIBECUT_TEST_MEDIA"));
+        let duration = super::probe(&media).unwrap().duration;
+        let started = std::time::Instant::now();
+        let (w, h, pictures) = super::thumbnails(&media, 1.0, 200).unwrap();
+        println!("{} pictures of {w}x{h} in {:?}", pictures.len(), started.elapsed());
+        assert_eq!(w, 200);
+        assert!((pictures.len() as f64 - duration).abs() <= 2.0, "{} for {duration} s", pictures.len());
+        assert!(pictures.iter().all(|p| p.len() == (w * h * 3) as usize));
+    }
+
     #[test]
     fn peaks_are_windowed_and_normalised() {
         let samples = [0.1, -0.5, 0.2, 0.0, 0.25, -0.1, 0.05];

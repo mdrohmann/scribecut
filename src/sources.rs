@@ -84,14 +84,14 @@ pub fn still(p: &Project, slide: &Slide, height: u32) -> Result<PathBuf> {
     }
 }
 
-fn cache_dir(p: &Project) -> Result<PathBuf> {
+pub(crate) fn cache_dir(p: &Project) -> Result<PathBuf> {
     let dir = p.base_dir().join(".scribecut-cache");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// A cache key that changes when the source file changes.
-fn key(path: &Path, extra: impl Hash) -> Result<String> {
+pub(crate) fn key(path: &Path, extra: impl Hash) -> Result<String> {
     let meta = std::fs::metadata(path).with_context(|| format!("{} not found", path.display()))?;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);

@@ -8,7 +8,7 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 
-use crate::project::{CameraMode, Corner, Project, Range};
+use crate::project::{Background, CameraMode, Corner, Project, Range};
 use crate::sources::{self, Input};
 
 /// Single-quotes a filtergraph option value (paths must not contain ":").
@@ -27,10 +27,20 @@ fn fit(w: u32, h: u32) -> String {
     format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1")
 }
 
+/// Input indices for the camera with its background replaced: the matte from
+/// `cutout::matte`, and the background picture unless the camera's own
+/// picture is blurred.
+#[derive(Clone, Copy, Debug)]
+pub struct CutoutInputs {
+    pub matte: usize,
+    pub image: Option<usize>,
+}
+
 /// Builds the `-filter_complex` graph. Input 0 is the recording (camera = its
 /// 2nd video stream); input `i + 1` is slide `i`, a video clip if `clips[i]`;
 /// after the slides come the voiceover takes, in order.
-/// `text_files[i]` holds overlay i's text.
+/// `text_files[i]` holds overlay i's text. `cutout` replaces the room behind
+/// the person on camera.
 /// `audio_cleanup` is an ffmpeg filter chain applied to the finished
 /// programme, after the kept ranges have been joined, so that leveling and
 /// loudness see exactly what the viewer will hear rather than each piece
@@ -41,6 +51,7 @@ pub fn filter_graph(
     text_files: &[PathBuf],
     font: Option<&Path>,
     audio_cleanup: Option<&str>,
+    cutout: Option<CutoutInputs>,
 ) -> String {
     let mut g = String::new();
     let (w, h) = (p.width, p.height);
@@ -61,7 +72,7 @@ pub fn filter_graph(
     }
 
     // Camera: full frame and/or a small window, on top of slides.
-    if p.camera_size.is_some() {
+    if let Some((cw, ch)) = p.camera_size {
         let full = p.camera_intervals(CameraMode::Full);
         let pip = p.camera_intervals(CameraMode::Pip);
         let wanted: Vec<&str> = [(!full.is_empty()).then_some("[cf]"), (!pip.is_empty()).then_some("[cp]")]
@@ -69,7 +80,36 @@ pub fn filter_graph(
             .flatten()
             .collect();
         if !wanted.is_empty() {
-            let _ = write!(g, "[0:v:1]split={}{};", wanted.len(), wanted.concat());
+            let mut camera = "[0:v:1]";
+            if let Some(c) = cutout {
+                // The person, made see-through where the matte is dark, over the background.
+                let _ = write!(g, "[0:v:1]split=2[camfg][camroom];[{}:v]scale={cw}:{ch},format=gray", c.matte);
+                match c.image {
+                    Some(i) => {
+                        let _ = write!(
+                            g,
+                            "[matte];[camroom]nullsink;[{i}:v]scale={cw}:{ch}:force_original_aspect_ratio=increase,\
+                             crop={cw}:{ch},setsar=1[cambg];"
+                        );
+                    }
+                    None => {
+                        // The room without the person, blurred: colours weighted by how much of
+                        // each pixel is room, blurred, then divided by the blurred weights (blend
+                        // divide is top * 255 / bottom). A plain blur smears the person into a
+                        // dark halo around them. As in `cutout::compose` for the preview.
+                        let r = crate::cutout::blur_radius(cw, ch);
+                        let _ = write!(
+                            g,
+                            ",split=2[matte][mroom];[mroom]negate,format=gbrp,split=2[weight][wblur];\
+                             [camroom]format=gbrp[roomrgb];[roomrgb][weight]blend=all_mode=multiply,boxblur={r}:2[roomsum];\
+                             [wblur]boxblur={r}:2[weightsum];[roomsum][weightsum]blend=all_mode=divide[cambg];"
+                        );
+                    }
+                }
+                let _ = write!(g, "[camfg][matte]alphamerge[camcut];[cambg][camcut]overlay=format=auto[cam];");
+                camera = "[cam]";
+            }
+            let _ = write!(g, "{camera}split={}{};", wanted.len(), wanted.concat());
         }
         if !full.is_empty() {
             let _ = write!(g, "[cf]{}[camfull];", fit(w, h));
@@ -223,7 +263,28 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
         .collect::<Result<_>>()?;
     let clips: Vec<bool> = inputs.iter().map(|i| matches!(i, Input::Clip { .. })).collect();
     let cleanup = crate::audio::cleanup(&p.media);
-    let mut graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref());
+    // The matte is made first (minutes, the first time); then the progress
+    // bar covers the two halves.
+    let mut made_matte = false;
+    let matte = match &p.camera_background {
+        Some(_) if p.camera_size.is_some() && !p.camera_shown().is_empty() => Some(
+            crate::cutout::matte(p, |f| {
+                made_matte = true;
+                progress(f / 2.0);
+            })
+            .context("cutting the person out of the camera picture")?,
+        ),
+        _ => None,
+    };
+    let background_image = match (&matte, &p.camera_background) {
+        (Some(_), Some(Background::Image(file))) => Some(p.resolve(file)),
+        _ => None,
+    };
+    let first_extra = 1 + inputs.len() + if p.has_audio { p.voiceovers.len() } else { 0 };
+    let cutout = matte
+        .as_ref()
+        .map(|_| CutoutInputs { matte: first_extra, image: background_image.as_ref().map(|_| first_extra + 1) });
+    let mut graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref(), cutout);
     let video_out = match small {
         Some(width) => {
             let _ = write!(graph, ";[outv]scale='min({width},iw)':-2[small]");
@@ -253,6 +314,13 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
             cmd.arg("-i").arg(p.resolve(&v.file));
         }
     }
+    if let Some(matte) = &matte {
+        cmd.arg("-i").arg(matte);
+    }
+    if let Some(image) = &background_image {
+        cmd.args(["-loop", "1", "-framerate", &format!("{}", p.fps), "-t", &format!("{:.3}", p.duration), "-i"])
+            .arg(image);
+    }
     cmd.args(["-filter_complex", &graph, "-map", video_out]);
     if p.has_audio {
         // Stereo AAC-LC at 48 kHz: what Slack, browsers and phones all play.
@@ -274,7 +342,8 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
     let total = p.output_duration().max(0.001);
     for line in BufReader::new(child.stdout.take().unwrap()).lines() {
         if let Some(us) = line?.strip_prefix("out_time_us=").and_then(|v| v.parse::<f64>().ok()) {
-            progress(((us / 1e6) / total).clamp(0.0, 1.0) as f32);
+            let f = ((us / 1e6) / total).clamp(0.0, 1.0) as f32;
+            progress(if made_matte { 0.5 + f / 2.0 } else { f });
         }
     }
     let output = child.wait_with_output()?;
@@ -298,7 +367,7 @@ mod tests {
 
     #[test]
     fn graph_without_edits_is_single_piece() {
-        let g = filter_graph(&project(), &[], &[], None, None);
+        let g = filter_graph(&project(), &[], &[], None, None, None);
         assert_eq!(
             g,
             "[0:v:0]null[vov];[vov]split=1[vs0];[0:a]asplit=1[as0];\
@@ -314,7 +383,7 @@ mod tests {
         p.has_audio = false;
         p.add_cut(Range::new(5.0, 8.0));
         p.overlays.push(Overlay { start: 1.0, end: 3.5, text: "hi".into(), x: 0.25, y: 0.75, size: 0.1, color: [255, 0, 16] });
-        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None);
+        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None, None);
         assert!(g.starts_with("[0:v:0]drawtext=fontfile='/f/a b.ttf':textfile='/t/o0.txt':"));
         assert!(g.contains("fontsize=72:fontcolor=0xff0010:"));
         assert!(g.contains("x=w*0.25000-text_w/2:y=h*0.75000-text_h/2:enable='between(t,1.000,3.500)'[vov]"));
@@ -343,6 +412,32 @@ mod tests {
     }
 
     #[test]
+    fn graph_with_camera_background() {
+        let mut p = project();
+        p.camera_size = Some((640, 480));
+        p.set_camera(Range::new(2.0, 5.0), CameraMode::Full);
+        let blur = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
+        assert!(
+            blur.starts_with(
+                "[0:v:1]split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
+                 [mroom]negate,format=gbrp,split=2[weight][wblur];\
+                 [camroom]format=gbrp[roomrgb];[roomrgb][weight]blend=all_mode=multiply,boxblur=20:2[roomsum];\
+                 [wblur]boxblur=20:2[weightsum];[roomsum][weightsum]blend=all_mode=divide[cambg];\
+                 [camfg][matte]alphamerge[camcut];[cambg][camcut]overlay=format=auto[cam];[cam]split=1[cf];"
+            ),
+            "{blur}"
+        );
+        let image = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: Some(2) }));
+        assert!(image.contains(
+            "[matte];[camroom]nullsink;[2:v]scale=640:480:force_original_aspect_ratio=increase,crop=640:480,setsar=1[cambg];"
+        ));
+        // Without the camera on screen there is nothing to cut out.
+        p.camera_ranges.clear();
+        let none = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
+        assert!(!none.contains("matte"), "{none}");
+    }
+
+    #[test]
     fn graph_with_slides_and_camera() {
         let mut p = project();
         let slide = |start, end| Slide { start, end, file: "x".into(), page: 1, clip_start: 0.0 };
@@ -350,7 +445,7 @@ mod tests {
         p.camera_size = Some((640, 480));
         p.set_camera(Range::new(13.0, 14.0), CameraMode::Full);
         p.set_camera(Range::new(15.0, 18.0), CameraMode::Pip);
-        let g = filter_graph(&p, &[false, true], &[], None, None);
+        let g = filter_graph(&p, &[false, true], &[], None, None, None);
         let fit = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
         assert!(g.starts_with(&format!(
             "[1:v]{fit},fps=30[s0];[0:v:0][s0]overlay=eof_action=pass:enable='between(t,2.000,4.000)'[b0];\

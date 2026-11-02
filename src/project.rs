@@ -183,6 +183,15 @@ impl Default for CameraSettings {
     }
 }
 
+/// What replaces the room behind the person on camera.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Background {
+    /// The camera's own picture, blurred.
+    Blur,
+    /// A picture, relative to the edit file's folder unless absolute.
+    Image(PathBuf),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Project {
     /// Absolute path of the recording.
@@ -204,7 +213,13 @@ pub struct Project {
     pub slides: Vec<Slide>,
     pub camera: CameraSettings,
     pub camera_ranges: Vec<CameraRange>,
+    /// Shown behind the person on camera instead of the room; `None` keeps the room.
+    pub camera_background: Option<Background>,
+    /// The re-recordings in use. At most one covers any moment.
     pub voiceovers: Vec<Voiceover>,
+    /// Re-recordings not in use: earlier takes replaced by a newer one, or set
+    /// aside for the recording's own sound. Kept so they can be switched back in.
+    pub spare_takes: Vec<Voiceover>,
 }
 
 impl Project {
@@ -254,6 +269,22 @@ impl Project {
     }
 
     /// The parts of the timeline shown with camera mode `mode`, merged.
+    /// Where the camera is on screen in the export: kept, and not hidden.
+    pub fn camera_shown(&self) -> Vec<Range> {
+        let mut shown: Vec<Range> = [CameraMode::Full, CameraMode::Pip]
+            .into_iter()
+            .flat_map(|m| self.camera_intervals(m))
+            .flat_map(|r| {
+                self.kept_ranges()
+                    .into_iter()
+                    .map(move |k| Range { start: r.start.max(k.start), end: r.end.min(k.end) })
+            })
+            .filter(|r| r.len() > 1e-6)
+            .collect();
+        shown.sort_by(|a, b| a.start.total_cmp(&b.start));
+        shown
+    }
+
     pub fn camera_intervals(&self, mode: CameraMode) -> Vec<Range> {
         let mut bounds = vec![0.0, self.duration];
         for r in &self.camera_ranges {
@@ -422,11 +453,59 @@ impl Project {
         kept.last().map_or(0.0, |r| r.end)
     }
 
-    /// Adds a re-recording, replacing any earlier one it overlaps.
+    /// Puts a re-recording in use. Takes in use that it overlaps are set aside
+    /// in `spare_takes`, so they can be switched back to.
     pub fn add_voiceover(&mut self, v: Voiceover) {
-        self.voiceovers.retain(|o| o.end <= v.start || o.start >= v.end);
+        let (replaced, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.voiceovers).into_iter().partition(|o| o.end > v.start && o.start < v.end);
+        self.voiceovers = kept;
+        self.spare_takes.extend(replaced);
+        self.spare_takes.retain(|o| o.file != v.file);
         self.voiceovers.push(v);
         self.voiceovers.sort_by(|a, b| a.start.total_cmp(&b.start));
+        self.spare_takes.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.file.cmp(&b.file)));
+    }
+
+    /// Switches spare take `i` in, setting aside the takes in use it overlaps.
+    pub fn use_spare_take(&mut self, i: usize) {
+        if i < self.spare_takes.len() {
+            let take = self.spare_takes.remove(i);
+            self.add_voiceover(take);
+        }
+    }
+
+    /// Sets the re-recordings in use over `range` aside: the recording's own sound plays there again.
+    pub fn use_original_sound(&mut self, range: Range) {
+        let (aside, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.voiceovers).into_iter().partition(|o| o.end > range.start && o.start < range.end);
+        self.voiceovers = kept;
+        self.spare_takes.extend(aside);
+        self.spare_takes.sort_by(|a, b| a.start.total_cmp(&b.start).then_with(|| a.file.cmp(&b.file)));
+    }
+
+    /// The takes, in use or spare, grouped into the stretches they cover:
+    /// takes that overlap belong to the same group. Each group lists its
+    /// takes as (in use, index into `voiceovers` or `spare_takes`).
+    pub fn take_groups(&self) -> Vec<(Range, Vec<(bool, usize)>)> {
+        let mut all: Vec<(Range, bool, usize)> = self
+            .voiceovers
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Range::new(v.start, v.end), true, i))
+            .chain(self.spare_takes.iter().enumerate().map(|(i, v)| (Range::new(v.start, v.end), false, i)))
+            .collect();
+        all.sort_by(|a, b| a.0.start.total_cmp(&b.0.start));
+        let mut groups: Vec<(Range, Vec<(bool, usize)>)> = Vec::new();
+        for (r, used, i) in all {
+            match groups.last_mut() {
+                Some((g, takes)) if r.start < g.end => {
+                    g.end = g.end.max(r.end);
+                    takes.push((used, i));
+                }
+                _ => groups.push((r, vec![(used, i)])),
+            }
+        }
+        groups
     }
 
     /// The words as the viewer hears them: the recording's own, with those in
@@ -544,6 +623,37 @@ mod tests {
         p.add_voiceover(v(8.0, 10.0, vec![]));
         p.add_voiceover(v(12.0, 13.0, vec![]));
         assert_eq!(p.voiceovers.iter().map(|v| v.start).collect::<Vec<_>>(), [8.0, 12.0]);
+    }
+
+    #[test]
+    fn takes_can_be_switched() {
+        let mut p = project();
+        let take = |start, end, file: &str| Voiceover {
+            start,
+            end,
+            file: file.into(),
+            pieces: vec![Range { start, end }],
+            stale_length: None,
+            words: vec![],
+        };
+        p.add_voiceover(take(2.0, 6.0, "take-1.flac"));
+        p.add_voiceover(take(3.0, 7.0, "take-2.flac"));
+        p.add_voiceover(take(12.0, 13.0, "take-3.flac"));
+        let files = |v: &[Voiceover]| v.iter().map(|t| t.file.display().to_string()).collect::<Vec<_>>();
+        assert_eq!(files(&p.voiceovers), ["take-2.flac", "take-3.flac"]);
+        assert_eq!(files(&p.spare_takes), ["take-1.flac"]);
+        assert_eq!(
+            p.take_groups(),
+            vec![(Range::new(2.0, 7.0), vec![(false, 0), (true, 0)]), (Range::new(12.0, 13.0), vec![(true, 1)])]
+        );
+        // Back to the first take: the second one is set aside.
+        p.use_spare_take(0);
+        assert_eq!(files(&p.voiceovers), ["take-1.flac", "take-3.flac"]);
+        assert_eq!(files(&p.spare_takes), ["take-2.flac"]);
+        // The recording's own sound: both takes are spare, none lost.
+        p.use_original_sound(Range::new(2.0, 7.0));
+        assert_eq!(files(&p.voiceovers), ["take-3.flac"]);
+        assert_eq!(files(&p.spare_takes), ["take-1.flac", "take-2.flac"]);
     }
 
     #[test]

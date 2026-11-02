@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::editor::fmt_time;
 use crate::project::{
-    CameraMode, CameraRange, CameraSettings, Corner, Cut, Overlay, Project, Range, Slide, Voiceover, Word,
+    Background, CameraMode, CameraRange, CameraSettings, Corner, Cut, Overlay, Project, Range, Slide, Voiceover, Word,
 };
 
 const HEADER: &str = r##"# scribecut edit file. Safe to edit by hand or by an agent while scribecut is
@@ -24,7 +24,9 @@ const HEADER: &str = r##"# scribecut edit file. Safe to edit by hand or by an ag
 # [source]          written by scribecut, don't edit
 # [camera]          default = "off" | "pip" | "full" where no [[camera_range]] applies;
 #                   pip = small window: corner ("top-left", "top-right", "bottom-left",
-#                   "bottom-right"), width and margin as fractions of the frame width
+#                   "bottom-right"), width and margin as fractions of the frame width;
+#                   background = "blur" | a picture (.png .jpg) - replaces the room behind
+#                   you on camera; leave it out to keep the room
 # [[cut]]           from, to, note (optional) - removed from the exported video
 # [[slide]]         from, to, file, page (PDF/presentation, 1-based), clip_start (video
 #                   clips) - shown INSTEAD of the screen recording. file: .png .jpg .pdf
@@ -38,6 +40,8 @@ const HEADER: &str = r##"# scribecut edit file. Safe to edit by hand or by an ag
 #                   back. Cuts added inside from..to later remove narration and picture
 #                   together; a part of from..to outside kept has no narration.
 #                   Its words are in <file>.transcript.json/.txt, on the file's timeline.
+#                   active = false: an earlier take, not heard, kept to switch back to;
+#                   takes in use must not overlap.
 # Layering: screen recording < slide < camera < overlay text.
 
 "##;
@@ -116,6 +120,8 @@ struct SourceDto {
 struct CameraDto {
     #[serde(default = "default_mode")]
     default: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background: Option<PathBuf>,
     #[serde(default)]
     pip: PipDto,
 }
@@ -126,7 +132,7 @@ fn default_mode() -> String {
 
 impl Default for CameraDto {
     fn default() -> Self {
-        Self { default: default_mode(), pip: PipDto::default() }
+        Self { default: default_mode(), background: None, pip: PipDto::default() }
     }
 }
 
@@ -199,6 +205,17 @@ struct VoiceoverDto {
     /// Older files: seconds recorded over, instead of `kept`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     length: Option<f64>,
+    /// False for a take kept but not in use.
+    #[serde(default = "in_use", skip_serializing_if = "is_in_use")]
+    active: bool,
+}
+
+fn in_use() -> bool {
+    true
+}
+
+fn is_in_use(active: &bool) -> bool {
+    *active
 }
 
 fn color_hex([r, g, b]: [u8; 3]) -> String {
@@ -246,7 +263,7 @@ fn load_toml(path: &Path) -> Result<Project> {
         let data = std::fs::read(&transcript)?;
         p.words = serde_json::from_slice(&data).with_context(|| format!("parsing {}", transcript.display()))?;
     }
-    for v in &mut p.voiceovers {
+    for v in p.voiceovers.iter_mut().chain(&mut p.spare_takes) {
         let transcript = transcript_path(&p.media.parent().unwrap_or(Path::new(".")).join(&v.file));
         if transcript.is_file() {
             let data = std::fs::read(&transcript)?;
@@ -319,7 +336,11 @@ fn from_toml(text: &str, dir: &Path) -> Result<Project> {
             .collect(),
         camera,
         camera_ranges,
+        camera_background: f.camera.background.map(|b| {
+            if b.as_os_str() == "blur" { Background::Blur } else { Background::Image(b) }
+        }),
         voiceovers: Vec::new(),
+        spare_takes: Vec::new(),
     };
     // Through add_cut so overlapping cuts written by hand are merged.
     for c in cuts {
@@ -338,7 +359,7 @@ fn from_toml(text: &str, dir: &Path) -> Result<Project> {
         } else {
             take.pieces = v.kept.iter().map(|[a, b]| Range::new(a.0, b.0)).collect();
         }
-        p.voiceovers.push(take);
+        if v.active { p.voiceovers.push(take) } else { p.spare_takes.push(take) }
     }
     p.voiceovers.sort_by(|a, b| a.start.total_cmp(&b.start));
     Ok(p)
@@ -359,6 +380,10 @@ fn to_toml(p: &Project) -> Result<String> {
         },
         camera: CameraDto {
             default: p.camera.default.name().into(),
+            background: p.camera_background.as_ref().map(|b| match b {
+                Background::Blur => PathBuf::from("blur"),
+                Background::Image(file) => file.clone(),
+            }),
             pip: PipDto { corner: p.camera.corner.name().into(), width: p.camera.width, margin: p.camera.margin },
         },
         cuts: p.cuts.iter().map(|c| CutDto { from: Time(c.start), to: Time(c.end), note: c.note.clone() }).collect(),
@@ -394,7 +419,9 @@ fn to_toml(p: &Project) -> Result<String> {
         voiceovers: p
             .voiceovers
             .iter()
-            .map(|v| VoiceoverDto {
+            .map(|v| (v, true))
+            .chain(p.spare_takes.iter().map(|v| (v, false)))
+            .map(|(v, active)| VoiceoverDto {
                 from: Time(v.start),
                 to: Time(v.end),
                 file: v.file.clone(),
@@ -404,6 +431,7 @@ fn to_toml(p: &Project) -> Result<String> {
                     v.pieces.iter().map(|r| [Time(r.start), Time(r.end)]).collect()
                 },
                 length: v.stale_length,
+                active,
             })
             .collect(),
     };
@@ -554,6 +582,13 @@ pub fn validate(p: &Project) -> Vec<String> {
             problems.push(format!("voiceover {}: overlaps an earlier voiceover", i + 1));
         }
     }
+    if let Some(Background::Image(file)) = &p.camera_background {
+        if !p.resolve(file).is_file() {
+            problems.push(format!("camera.background: file {} not found", file.display()));
+        } else if crate::sources::kind(file) != Some(crate::sources::Kind::Image) {
+            problems.push(format!("camera.background: {} is not a .png or .jpg picture", file.display()));
+        }
+    }
     if p.camera_size.is_none() && (!p.camera_ranges.is_empty() || p.camera.default != CameraMode::Off) {
         problems.push("camera settings are ignored: this recording has no camera track".into());
     }
@@ -595,11 +630,20 @@ mod tests {
             slides: vec![Slide { start: 20.0, end: 30.0, file: "slides/deck.pdf".into(), page: 3, clip_start: 0.0 }],
             camera: CameraSettings { default: CameraMode::Pip, ..Default::default() },
             camera_ranges: vec![CameraRange { start: 20.0, end: 25.0, mode: CameraMode::Full }],
+            camera_background: Some(Background::Image("backgrounds/office.jpg".into())),
             voiceovers: vec![Voiceover {
                 start: 40.0,
                 end: 50.5,
                 file: "voiceovers/take-1.flac".into(),
                 pieces: vec![Range { start: 40.0, end: 50.5 }],
+                stale_length: None,
+                words: vec![],
+            }],
+            spare_takes: vec![Voiceover {
+                start: 41.0,
+                end: 49.0,
+                file: "voiceovers/take-0.flac".into(),
+                pieces: vec![Range { start: 41.0, end: 49.0 }],
                 stale_length: None,
                 words: vec![],
             }],
@@ -617,6 +661,8 @@ mod tests {
         let mut back = from_toml(&text, Path::new("/rec")).unwrap();
         back.words = p.words.clone();
         assert_eq!(back, p);
+        let blur = text.replace("backgrounds/office.jpg", "blur");
+        assert_eq!(from_toml(&blur, Path::new("/rec")).unwrap().camera_background, Some(Background::Blur));
     }
 
     #[test]

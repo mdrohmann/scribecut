@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use egui::{Align, Align2, Color32, FontFamily, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 
 use crate::player::{Player, preview_size};
-use crate::project::{CameraMode, Corner, Overlay, Project, Range, Slide, Voiceover, Word, word_at};
+use crate::project::{Background, CameraMode, Corner, Overlay, Project, Range, Slide, Voiceover, Word, word_at};
 use crate::transcribe;
 use crate::voiceover::Microphone;
 
@@ -28,6 +28,24 @@ const CAMERA_FULL: Color32 = Color32::from_rgb(220, 120, 40);
 const CAMERA_PIP: Color32 = Color32::from_rgb(170, 110, 60);
 const VOICEOVER: Color32 = Color32::from_rgba_premultiplied(120, 60, 140, 70);
 const WARNING: Color32 = Color32::from_rgb(230, 90, 90);
+
+/// Width of the timeline's hover previews, in pixels.
+const THUMB_WIDTH: u32 = 200;
+
+/// Seconds between the timeline's hover previews: one per second, at most about 450 in all.
+fn thumbnail_step(duration: f64) -> f64 {
+    (duration / 450.0).max(1.0)
+}
+
+/// A change of which sound plays over a re-recorded stretch.
+enum TakeSwitch {
+    /// The recording's own sound over the range.
+    Original(Range),
+    /// Spare take `i` instead of what is in use.
+    Spare(usize),
+    /// Drop spare take `i` from the project.
+    Forget(usize),
+}
 
 /// Seconds counted down before a re-recording starts.
 const COUNTDOWN: f64 = 3.0;
@@ -188,8 +206,13 @@ pub struct Editor {
     pos: f64,
     selection: Option<Range>,
     anchor_word: Option<usize>,
-    /// Visible timeline window: start and length in seconds.
+    /// Visible timeline window: start and length in seconds, on the timeline shown
+    /// (the edited video's when `edited_view`, else the recording's).
     view: (f64, f64),
+    /// The timeline shows the edited video: cut parts collapse to thin marks.
+    edited_view: bool,
+    /// The project's kept ranges, refreshed every frame for the timeline's time mapping.
+    kept: Vec<Range>,
     drag_from: Option<f64>,
     draft: Option<Draft>,
     placing: bool,
@@ -199,6 +222,20 @@ pub struct Editor {
     /// Camera track player, kept in step with `player`.
     camera: Option<Player>,
     camera_texture: Option<egui::TextureHandle>,
+    /// The latest camera frame as decoded, before its background is replaced.
+    camera_raw: Option<crate::player::Frame>,
+    /// The camera texture needs redrawing (new frame, new matte or new background).
+    camera_dirty: bool,
+    /// Cuts the person out of camera frames while a background is set.
+    live_matte: Option<crate::cutout::LiveMatte>,
+    /// Number of the matte the camera texture was drawn with.
+    matte_seen: u64,
+    /// `camera_raw` has been handed to `live_matte`.
+    camera_submitted: bool,
+    /// The background picture at the camera preview's size: (file, size, RGBA).
+    background_pixels: Option<(PathBuf, (usize, usize), Vec<u8>)>,
+    /// The last background picture chosen, so B can come back to it.
+    last_background_image: Option<PathBuf>,
     /// Slide pictures for the preview, by slide file/page.
     slide_images: HashMap<SlideKey, SlideImage>,
     /// Modification time of the edit file as we last wrote or read it.
@@ -211,6 +248,14 @@ pub struct Editor {
     /// Background-noise level in dB; the waveform is drawn from here up to 0 dB.
     waveform_floor_db: f32,
     waveform_job: Option<Job<Vec<f32>>>,
+    /// Pictures of the recording for the timeline's hover preview, one every `thumb_step` seconds.
+    /// RGB pixels of each picture, kept compact: a long recording has hundreds.
+    thumbnails: Vec<Vec<u8>>,
+    thumb_size: [usize; 2],
+    thumb_step: f64,
+    thumbnail_job: Option<Job<crate::media::Thumbnails>>,
+    /// The hover preview's texture and which thumbnail it shows.
+    thumb_texture: Option<(usize, egui::TextureHandle)>,
     /// Renders the cleaned-up narration; playback switches to it when done.
     clean_audio_job: Option<Job<Option<PathBuf>>>,
     ctx: egui::Context,
@@ -256,6 +301,8 @@ impl Editor {
             selection: None,
             anchor_word: None,
             view: (0.0, duration),
+            edited_view: false,
+            kept: Vec::new(),
             drag_from: None,
             draft: None,
             placing: false,
@@ -263,6 +310,13 @@ impl Editor {
             undo: Vec::new(),
             camera,
             camera_texture: None,
+            camera_raw: None,
+            camera_dirty: false,
+            live_matte: None,
+            matte_seen: 0,
+            camera_submitted: false,
+            background_pixels: None,
+            last_background_image: None,
             slide_images: HashMap::new(),
             edit_mtime: None,
             last_reload_check: Instant::now(),
@@ -270,12 +324,22 @@ impl Editor {
             waveform: Vec::new(),
             waveform_floor_db: -50.0,
             waveform_job: None,
+            thumbnails: Vec::new(),
+            thumb_size: [0, 0],
+            thumb_step: thumbnail_step(duration),
+            thumbnail_job: None,
+            thumb_texture: None,
             clean_audio_job: None,
             ctx: ctx.clone(),
             export: None,
             message: None,
             last_scrolled_word: None,
         };
+        {
+            let (media, step) = (editor.project.media.clone(), editor.thumb_step);
+            editor.thumbnail_job =
+                Some(Job::spawn(ctx, "Timeline previews", move |_| crate::media::thumbnails(&media, step, THUMB_WIDTH)));
+        }
         if editor.project.has_audio {
             let media = editor.project.media.clone();
             editor.waveform_job = Some(Job::spawn(ctx, "Waveform", move |_| crate::media::audio_peaks(&media)));
@@ -319,6 +383,10 @@ impl Editor {
     /// audio if the takes or the cuts inside them changed.
     fn refresh(&mut self) {
         self.words = self.project.heard_words();
+        self.camera_dirty = true;
+        if let Some(Background::Image(file)) = &self.project.camera_background {
+            self.last_background_image = Some(file.clone());
+        }
         let key = crate::voiceover::splice(&self.project, "", 0, "");
         if key != self.audio_key {
             self.audio_key = key;
@@ -578,6 +646,7 @@ impl Editor {
         self.upload_frame(&ctx);
         self.upload_camera_frame(&ctx);
         self.update_dub(&ctx);
+        self.kept = self.project.kept_ranges();
         self.keyboard(&ctx);
 
         let mut action = None;
@@ -881,6 +950,18 @@ impl Editor {
                 Err(e) => self.message = Some(format!("Preparing the audio failed: {e:#}")),
             }
         }
+        if let Some(job) = &mut self.thumbnail_job
+            && let Some(result) = job.poll()
+        {
+            self.thumbnail_job = None;
+            match result {
+                Ok((w, h, pictures)) => {
+                    self.thumb_size = [w as usize, h as usize];
+                    self.thumbnails = pictures;
+                }
+                Err(e) => self.message = Some(format!("Timeline previews failed: {e:#}")),
+            }
+        }
         if let Some(job) = &mut self.waveform_job
             && let Some(result) = job.poll()
         {
@@ -936,8 +1017,9 @@ impl Editor {
 
     fn follow_playhead(&mut self) {
         let (start, len) = self.view;
-        if self.pos < start || self.pos > start + len {
-            self.view.0 = (self.pos - len * 0.1).clamp(0.0, (self.project.duration - len).max(0.0));
+        let at = self.source_to_view(self.pos);
+        if at < start || at > start + len {
+            self.view.0 = (at - len * 0.1).clamp(0.0, (self.view_duration() - len).max(0.0));
         }
     }
 
@@ -952,12 +1034,104 @@ impl Editor {
 
     fn upload_camera_frame(&mut self, ctx: &egui::Context) {
         let Some(cam) = &self.camera else { return };
-        let Some(frame) = cam.frame.lock().unwrap().take() else { return };
-        let image = egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.rgba);
+        let Some(camera_size) = self.project.camera_size else { return };
+        let cutout = self.project.camera_background.is_some() && self.project.camera_mode_at(self.pos) != CameraMode::Off;
+        if cutout && self.live_matte.is_none() {
+            let ctx = ctx.clone();
+            self.live_matte = Some(crate::cutout::LiveMatte::start(camera_size, move || ctx.request_repaint()));
+            self.camera_dirty = true;
+        }
+        if let Some(frame) = cam.frame.lock().unwrap().take() {
+            self.camera_raw = Some(frame);
+            self.camera_dirty = true;
+            self.camera_submitted = false;
+        }
+        let mut matte = None;
+        if let Some(live) = &self.live_matte {
+            if let Some(e) = live.error() {
+                self.message = Some(format!("Camera background: {e}"));
+                self.project.camera_background = None;
+                self.live_matte = None;
+                return;
+            }
+            let (latest, n) = live.latest();
+            if n != self.matte_seen {
+                self.matte_seen = n;
+                self.camera_dirty = true;
+            }
+            matte = latest;
+        }
+        if !std::mem::take(&mut self.camera_dirty) {
+            return;
+        }
+        let Some(frame) = &self.camera_raw else { return };
+        let (w, h) = (frame.width, frame.height);
+        let mut rgba = frame.rgba.clone();
+        if cutout {
+            if let Some(live) = &self.live_matte
+                && !self.camera_submitted
+            {
+                live.submit(w, h, frame.rgba.clone());
+                self.camera_submitted = true;
+            }
+            if let Some(matte) = matte {
+                let picture = match self.project.camera_background.clone() {
+                    Some(Background::Image(file)) => self.background_pixels(&file, w, h),
+                    _ => None,
+                };
+                crate::cutout::compose(&mut rgba, w, h, &matte, picture.as_deref());
+            }
+        }
+        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         match &mut self.camera_texture {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),
             None => self.camera_texture = Some(ctx.load_texture("camera", image, egui::TextureOptions::LINEAR)),
         }
+    }
+
+    /// The background picture scaled and cropped to fill `w`×`h`, as RGBA.
+    fn background_pixels(&mut self, file: &Path, w: usize, h: usize) -> Option<Vec<u8>> {
+        let path = self.project.resolve(file);
+        if !matches!(&self.background_pixels, Some((p, size, _)) if *p == path && *size == (w, h)) {
+            let picture = match image::open(&path) {
+                Ok(i) => i.resize_to_fill(w as u32, h as u32, image::imageops::FilterType::Triangle).to_rgba8(),
+                Err(e) => {
+                    self.message = Some(format!("Camera background {}: {e}", file.display()));
+                    return None;
+                }
+            };
+            self.background_pixels = Some((path, (w, h), picture.into_raw()));
+        }
+        self.background_pixels.as_ref().map(|(_, _, px)| px.clone())
+    }
+
+    /// Sets what replaces the room behind the person on camera.
+    fn set_background(&mut self, background: Option<Background>) {
+        if self.project.camera_background != background {
+            self.edit(|p| p.camera_background = background);
+        }
+    }
+
+    /// B: no background → blurred room → the last picture (if one was chosen) → no background.
+    fn cycle_background(&mut self) {
+        let next = match (&self.project.camera_background, &self.last_background_image) {
+            (None, _) => Some(Background::Blur),
+            (Some(Background::Blur), Some(file)) => Some(Background::Image(file.clone())),
+            _ => None,
+        };
+        self.set_background(next);
+    }
+
+    /// Picks a picture to show behind the person on camera.
+    fn pick_background(&mut self) {
+        let dialog = rfd::FileDialog::new()
+            .add_filter("Picture", &["png", "jpg", "jpeg"])
+            .set_directory(self.project.base_dir());
+        let Some(file) = dialog.pick_file() else { return };
+        let base = self.project.base_dir();
+        let file = file.strip_prefix(&base).map(Path::to_path_buf).unwrap_or(file);
+        self.last_background_image = Some(file.clone());
+        self.set_background(Some(Background::Image(file)));
     }
 
     fn frame_step(&self) -> f64 {
@@ -970,6 +1144,12 @@ impl Editor {
         }
         if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, Key::C)) {
             self.center_view();
+        }
+        if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, Key::E)) {
+            self.toggle_edited_view();
+        }
+        if self.project.camera_size.is_some() && ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::NONE, Key::B)) {
+            self.cycle_background();
         }
         // Consume the keys before widgets run, so e.g. Space doesn't also press a focused button.
         // Shift variants first: consume_key ignores extra Shift when matching.
@@ -1013,12 +1193,113 @@ impl Editor {
         if undo {
             self.undo();
         }
+        let (home, end, back, pause, forward, prev_word, next_word, prev_point, next_point) = ctx.input_mut(|inp| {
+            use egui::Modifiers as M;
+            (
+                inp.consume_key(M::NONE, Key::Home),
+                inp.consume_key(M::NONE, Key::End),
+                inp.consume_key(M::NONE, Key::J),
+                inp.consume_key(M::NONE, Key::K),
+                inp.consume_key(M::NONE, Key::L),
+                inp.consume_key(M::COMMAND, Key::ArrowLeft),
+                inp.consume_key(M::COMMAND, Key::ArrowRight),
+                inp.consume_key(M::NONE, Key::ArrowUp),
+                inp.consume_key(M::NONE, Key::ArrowDown),
+            )
+        });
+        if home {
+            self.seek(0.0);
+        }
+        if end {
+            self.seek(self.project.duration);
+        }
+        if pause && self.player.playing {
+            self.toggle_play();
+        }
+        for (pressed, delta) in [(back, -5.0), (forward, 5.0)] {
+            if pressed {
+                self.seek(self.pos + delta);
+            }
+        }
+        // A little slack, so pressing again moves on rather than staying put.
+        let slack = self.frame_step() / 2.0;
+        let words: Vec<f64> = self.words.iter().map(|w| w.start).collect();
+        let points = self.edit_points();
+        for (pressed, times, forward) in
+            [(prev_word, &words, false), (next_word, &words, true), (prev_point, &points, false), (next_point, &points, true)]
+        {
+            if !pressed {
+                continue;
+            }
+            let target = if forward {
+                times.iter().copied().filter(|&t| t > self.pos + slack).reduce(f64::min)
+            } else {
+                times.iter().copied().filter(|&t| t < self.pos - slack).reduce(f64::max)
+            };
+            if let Some(t) = target {
+                self.seek(t);
+            }
+        }
+    }
+
+    /// Where something changes: cut, slide, overlay, camera and re-recording edges and resume points.
+    fn edit_points(&self) -> Vec<f64> {
+        let p = &self.project;
+        let ranges = p
+            .cuts
+            .iter()
+            .map(|c| (c.start, c.end))
+            .chain(p.slides.iter().map(|s| (s.start, s.end)))
+            .chain(p.overlays.iter().map(|o| (o.start, o.end)))
+            .chain(p.camera_ranges.iter().map(|r| (r.start, r.end)))
+            .chain(p.voiceovers.iter().map(|v| (v.start, v.end)));
+        ranges.flat_map(|(a, b)| [a, b]).chain(p.segment_starts.iter().copied()).collect()
     }
 
     /// Scrolls the timeline so the playhead is in the middle, keeping the zoom.
     fn center_view(&mut self) {
         let len = self.view.1;
-        self.view.0 = (self.pos - len / 2.0).clamp(0.0, (self.project.duration - len).max(0.0));
+        self.view.0 = (self.source_to_view(self.pos) - len / 2.0).clamp(0.0, (self.view_duration() - len).max(0.0));
+    }
+
+    /// Switches between the recording's timeline and the edited video's,
+    /// keeping the playhead where it is on screen.
+    fn toggle_edited_view(&mut self) {
+        let (start, len) = self.view;
+        let on_screen = (self.source_to_view(self.pos) - start) / len;
+        self.edited_view = !self.edited_view;
+        let len = len.min(self.view_duration());
+        let start = self.source_to_view(self.pos) - on_screen * len;
+        self.view = (start.clamp(0.0, (self.view_duration() - len).max(0.0)), len);
+    }
+
+    /// A time on the recording as a time on the timeline shown.
+    fn source_to_view(&self, t: f64) -> f64 {
+        if !self.edited_view {
+            return t;
+        }
+        self.kept.iter().map(|r| (t.min(r.end) - r.start).max(0.0)).sum()
+    }
+
+    /// A time on the timeline shown as a time on the recording.
+    fn view_to_source(&self, v: f64) -> f64 {
+        if !self.edited_view {
+            return v;
+        }
+        let mut left = v.max(0.0);
+        for r in &self.kept {
+            if left <= r.len() {
+                return r.start + left;
+            }
+            left -= r.len();
+        }
+        self.kept.last().map_or(0.0, |r| r.end)
+    }
+
+    /// Length of the timeline shown.
+    fn view_duration(&self) -> f64 {
+        let d = if self.edited_view { self.kept.iter().map(Range::len).sum() } else { self.project.duration };
+        d.max(0.1)
     }
 
     fn mark_in(&mut self) {
@@ -1100,6 +1381,40 @@ impl Editor {
         })
         .response
         .on_disabled_hover_text("This recording has no camera track");
+        let label = match &self.project.camera_background {
+            None => "Background".to_string(),
+            Some(Background::Blur) => "Background: blur".to_string(),
+            Some(Background::Image(f)) => {
+                format!("Background: {}", f.file_name().map_or_else(|| f.display().to_string(), |n| n.to_string_lossy().into()))
+            }
+        };
+        ui.add_enabled_ui(has_camera, |ui| {
+            ui.menu_button(label, |ui| {
+                if ui.radio(self.project.camera_background.is_none(), "Room (as recorded)").clicked() {
+                    self.set_background(None);
+                    ui.close();
+                }
+                if ui.radio(self.project.camera_background == Some(Background::Blur), "Blurred room").clicked() {
+                    self.set_background(Some(Background::Blur));
+                    ui.close();
+                }
+                if let Some(file) = self.last_background_image.clone() {
+                    let chosen = self.project.camera_background == Some(Background::Image(file.clone()));
+                    if ui.radio(chosen, format!("Picture: {}", file.display())).clicked() {
+                        self.set_background(Some(Background::Image(file)));
+                        ui.close();
+                    }
+                }
+                if ui.button("Picture…").clicked() {
+                    ui.close();
+                    self.pick_background();
+                }
+            })
+            .response
+            .on_hover_text("What is behind you on camera (B). The model cutting you out runs on first use; the preview's cut-out is rougher than the export's")
+        })
+        .response
+        .on_disabled_hover_text("This recording has no camera track");
         if ui.add_enabled(!self.undo.is_empty(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
             self.undo();
         }
@@ -1121,6 +1436,13 @@ impl Editor {
         }
         ui.monospace(format!("→ {}", fmt_time(self.project.output_duration())))
             .on_hover_text("Length after cuts");
+        if ui
+            .selectable_label(self.edited_view, "Hide cuts")
+            .on_hover_text("Show the timeline as the edited video: cut parts shrink to thin red marks (E)")
+            .clicked()
+        {
+            self.toggle_edited_view();
+        }
         // Selection info goes last so the buttons above never shift around.
         if let Some(sel) = self.selection {
             ui.separator();
@@ -1473,14 +1795,14 @@ impl Editor {
         let width = ui.available_width();
         let (rect, response) = ui.allocate_exact_size(vec2(width, 184.0), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
-        let duration = self.project.duration.max(0.1);
+        let duration = self.view_duration();
 
         // Zoom with the wheel around the pointer; pan with shift+wheel / horizontal scroll.
         if response.hovered() {
             let (scroll, pointer) = ui.input(|i| (i.smooth_scroll_delta, i.pointer.hover_pos()));
             let (mut start, mut len) = self.view;
             if scroll.y != 0.0 {
-                let anchor = pointer.map_or(start + len / 2.0, |p| self.x_to_t(rect, p.x));
+                let anchor = pointer.map_or(start + len / 2.0, |p| start + ((p.x - rect.left()) / rect.width()) as f64 * len);
                 let new_len = (len * (-scroll.y as f64 * 0.003).exp()).clamp(1.0, duration);
                 start = anchor - (anchor - start) * new_len / len;
                 len = new_len;
@@ -1512,7 +1834,7 @@ impl Editor {
             .unwrap_or(3600.0);
         let mut t = (start / step).floor() * step;
         while t <= start + len {
-            let x = self.t_to_x(rect, t);
+            let x = rect.left() + ((t - start) / len) as f32 * width;
             painter.line_segment([pos2(x, ruler.top() + 10.0), pos2(x, ruler.bottom())], Stroke::new(1.0, visuals.weak_text_color()));
             painter.text(pos2(x + 3.0, ruler.top()), Align2::LEFT_TOP, fmt_time(t), FontId::monospace(10.0), visuals.weak_text_color());
             t += step;
@@ -1521,8 +1843,9 @@ impl Editor {
         // Words as alternating blocks, labelled when zoomed in far enough.
         let shades = [Color32::from_gray(55), Color32::from_gray(75)];
         let word_font = FontId::proportional(11.0);
+        let (from, to) = (self.view_to_source(start), self.view_to_source(start + len));
         for (i, w) in self.words.iter().enumerate() {
-            if w.end < start || w.start > start + len {
+            if w.end < from || w.start > to {
                 continue;
             }
             let r = self.span(track, w.start, w.end).shrink2(vec2(0.5, 8.0));
@@ -1533,15 +1856,32 @@ impl Editor {
         }
 
         self.paint_waveform(&painter, wave);
-        for v in &self.project.voiceovers {
-            let r = self.span(wave, v.start, v.end);
-            painter.rect_filled(r, 0.0, VOICEOVER);
-            let stale = self.project.voiceover_problem(v).is_some();
-            if stale {
-                painter.rect_stroke(r, 0.0, Stroke::new(2.0, WARNING), egui::StrokeKind::Inside);
+        // Re-recorded stretches: the take in use filled, with how many versions there are.
+        for (range, takes) in self.project.take_groups() {
+            let versions = takes.len() + 1;
+            let in_use: Vec<&crate::project::Voiceover> =
+                takes.iter().filter(|t| t.0).map(|&(_, i)| &self.project.voiceovers[i]).collect();
+            if in_use.is_empty() {
+                let r = self.span(wave, range.start, range.end);
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, VOICEOVER), egui::StrokeKind::Inside);
+                let label = format!("original sound · {versions} versions, switch in the list");
+                painter.with_clip_rect(r).text(r.left_top() + vec2(4.0, 2.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), Color32::WHITE);
             }
-            let label = if stale { "re-recorded - needs attention, see the list" } else { "re-recorded" };
-            painter.with_clip_rect(r).text(r.left_top() + vec2(4.0, 2.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), Color32::WHITE);
+            for v in in_use {
+                let r = self.span(wave, v.start, v.end);
+                painter.rect_filled(r, 0.0, VOICEOVER);
+                let stale = self.project.voiceover_problem(v).is_some();
+                if stale {
+                    painter.rect_stroke(r, 0.0, Stroke::new(2.0, WARNING), egui::StrokeKind::Inside);
+                }
+                let name = v.file.file_stem().unwrap_or_default().to_string_lossy();
+                let label = match (stale, versions) {
+                    (true, _) => format!("{name} - needs attention, see the list"),
+                    (false, 2) => format!("re-recorded: {name}"),
+                    (false, n) => format!("re-recorded: {name} · {n} versions, switch in the list"),
+                };
+                painter.with_clip_rect(r).text(r.left_top() + vec2(4.0, 2.0), Align2::LEFT_TOP, label, FontId::proportional(11.0), Color32::WHITE);
+            }
         }
 
         // Cuts, selection and resume points span the word track and the waveform.
@@ -1642,9 +1982,60 @@ impl Editor {
                 });
             }
         }
-        response.on_hover_text_at_pointer(
-            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan · C: centre on the playhead\nRight-click a red cut to restore it · Click a slide (purple) or overlay (green) bar to edit it\nCamera strip: orange = only me, brown = small window; right-click an outlined range to remove it",
-        );
+        // Hovering: a picture of the recording at the pointer, above the timeline.
+        if let Some(p) = response.hover_pos()
+            && !ruler.contains(p)
+            && !response.dragged()
+        {
+            self.thumbnail_popup(ui.ctx(), rect, p);
+        }
+        // Help on the ruler, where it doesn't cover the preview.
+        if response.hover_pos().is_some_and(|p| ruler.contains(p)) {
+            response.on_hover_text_at_pointer(
+            "Click: seek · Drag: select · Wheel: zoom · Shift+wheel: pan · C: centre on the playhead\n\
+             ←/→: one frame · Shift+←/→: one second · J/L: 5 seconds · K: pause · Ctrl+←/→: word · ↑/↓: next edit point · Home/End\nRight-click a red cut to restore it · Click a slide (purple) or overlay (green) bar to edit it\nCamera strip: orange = only me, brown = small window; right-click an outlined range to remove it · B: camera background · E: hide cuts",
+            );
+        }
+    }
+
+    /// The recording's picture at the pointer's time, floating above the timeline.
+    fn thumbnail_popup(&mut self, ctx: &egui::Context, timeline: Rect, pointer: Pos2) {
+        let t = self.x_to_t(timeline, pointer.x);
+        if self.thumbnails.is_empty() {
+            return;
+        }
+        let i = ((t / self.thumb_step) as usize).min(self.thumbnails.len() - 1);
+        let picture = || egui::ColorImage::from_rgb(self.thumb_size, &self.thumbnails[i]);
+        match &mut self.thumb_texture {
+            Some((shown, _)) if *shown == i => {}
+            Some((shown, tex)) => {
+                tex.set(picture(), egui::TextureOptions::LINEAR);
+                *shown = i;
+            }
+            None => {
+                let tex = ctx.load_texture("timeline preview", picture(), egui::TextureOptions::LINEAR);
+                self.thumb_texture = Some((i, tex));
+            }
+        }
+        let Some((_, tex)) = &self.thumb_texture else { return };
+        let size = tex.size_vec2();
+        let screen = ctx.content_rect();
+        let x = (pointer.x - size.x / 2.0).clamp(screen.left() + 4.0, (screen.right() - size.x - 16.0).max(screen.left()));
+        let y = timeline.top() - size.y - 34.0;
+        let label = match self.project.cut_at(t) {
+            Some(_) => format!("{} (cut)", fmt_time(t)),
+            None => fmt_time(t),
+        };
+        egui::Area::new(egui::Id::new("timeline preview"))
+            .fixed_pos(pos2(x, y))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.image((tex.id(), size));
+                    ui.monospace(label);
+                });
+            });
     }
 
     /// Draws the loudness envelope on a dB scale, so pauses between words show
@@ -1676,7 +2067,8 @@ impl Editor {
         // Word starts as faint guides, to relate the gaps to the transcript.
         let guide = Stroke::new(1.0, Color32::from_white_alpha(28));
         let (start, len) = self.view;
-        for w in self.words.iter().filter(|w| w.start >= start && w.start <= start + len) {
+        let (from, to) = (self.view_to_source(start), self.view_to_source(start + len));
+        for w in self.words.iter().filter(|w| w.start >= from && w.start <= to) {
             let x = self.t_to_x(wave, w.start);
             painter.line_segment([pos2(x, wave.top()), pos2(x, wave.bottom())], guide);
         }
@@ -1697,11 +2089,12 @@ impl Editor {
     }
 
     fn t_to_x(&self, rect: Rect, t: f64) -> f32 {
-        rect.left() + ((t - self.view.0) / self.view.1) as f32 * rect.width()
+        rect.left() + ((self.source_to_view(t) - self.view.0) / self.view.1) as f32 * rect.width()
     }
 
     fn x_to_t(&self, rect: Rect, x: f32) -> f64 {
-        (self.view.0 + ((x - rect.left()) / rect.width()) as f64 * self.view.1).clamp(0.0, self.project.duration)
+        let v = (self.view.0 + ((x - rect.left()) / rect.width()) as f64 * self.view.1).clamp(0.0, self.view_duration());
+        self.view_to_source(v).clamp(0.0, self.project.duration)
     }
 
     fn span(&self, row: Rect, a: f64, b: f64) -> Rect {
@@ -1869,29 +2262,51 @@ impl Editor {
                     }
                 });
         }
-        let mut remove_voiceover = None;
-        egui::CollapsingHeader::new(format!("Re-recorded audio ({})", self.project.voiceovers.len()))
+        // Each stretch with re-recordings: the recording's own sound or one of the takes.
+        let mut switch = None;
+        let groups = self.project.take_groups();
+        egui::CollapsingHeader::new(format!("Re-recorded audio ({})", groups.len()))
             .default_open(true)
             .show(ui, |ui| {
-                for (i, v) in self.project.voiceovers.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if ui.link(format!("{} – {}", fmt_time(v.start), fmt_time(v.end))).clicked() {
-                            seek = Some(v.start);
+                for (range, takes) in &groups {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.link(format!("{} – {}", fmt_time(range.start), fmt_time(range.end))).clicked() {
+                            seek = Some(range.start);
                         }
-                        ui.label(v.file.file_name().unwrap_or_default().to_string_lossy());
-                        if let Some(problem) = self.project.voiceover_problem(v) {
-                            ui.colored_label(WARNING, "needs attention").on_hover_text(problem);
+                        let original = !takes.iter().any(|&(used, _)| used);
+                        if ui.radio(original, "original").on_hover_text("The recording's own sound").clicked() && !original {
+                            switch = Some(TakeSwitch::Original(*range));
                         }
-                        if ui.small_button("Remove").on_hover_text("Back to the recording's own sound").clicked() {
-                            remove_voiceover = Some(i);
+                        for &(used, i) in takes {
+                            let v = if used { &self.project.voiceovers[i] } else { &self.project.spare_takes[i] };
+                            let name = v.file.file_stem().unwrap_or_default().to_string_lossy();
+                            let said: Vec<&str> = v.words.iter().take(8).map(|w| w.text.as_str()).collect();
+                            let hover = format!("{} – {}: {}…", fmt_time(v.start), fmt_time(v.end), said.join(" "));
+                            if ui.radio(used, name).on_hover_text(hover).clicked() && !used {
+                                switch = Some(TakeSwitch::Spare(i));
+                            }
+                            if used && let Some(problem) = self.project.voiceover_problem(v) {
+                                ui.colored_label(WARNING, "needs attention").on_hover_text(problem);
+                            }
+                            if !used
+                                && ui
+                                    .small_button("×")
+                                    .on_hover_text("Drop this take from the list (its file stays in voiceovers/)")
+                                    .clicked()
+                            {
+                                switch = Some(TakeSwitch::Forget(i));
+                            }
                         }
                     });
                 }
             });
-        if let Some(i) = remove_voiceover {
-            self.edit(|p| {
-                p.voiceovers.remove(i);
-            });
+        match switch {
+            Some(TakeSwitch::Original(range)) => self.edit(|p| p.use_original_sound(range)),
+            Some(TakeSwitch::Spare(i)) => self.edit(|p| p.use_spare_take(i)),
+            Some(TakeSwitch::Forget(i)) => self.edit(|p| {
+                p.spare_takes.remove(i);
+            }),
+            None => {}
         }
         if let Some(t) = seek {
             self.seek(t);

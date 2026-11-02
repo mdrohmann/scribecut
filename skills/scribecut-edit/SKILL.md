@@ -61,7 +61,10 @@ Three scripts do the mechanical work; your job is reading the overview and writi
    WARNING means a boundary had no pause and was put at the quietest 50 ms nearby - list
    those as spots to listen to. The first run backs the edit file up to
    `recording.edit.toml.orig` and every run rebuilds from it, so re-run freely. Pause cuts
-   leave 0.10 s each side (`pad`) and only touch pauses of 0.35 s or more (`min_pause`).
+   leave 0.20 s each side (`pad`), only touch pauses of 0.8 s or more (`min_pause`), and
+   skip a pause under 2 s rather than leave a piece shorter than 1.5 s (`min_piece`):
+   every cut makes the picture jump, and many short pieces look jittery. Lower them only
+   when the user asks for a tighter cut.
    Plain seconds still work for any time.
 4. **Hit the length limit.** If the length is over the limit, drop the least essential
    kept passage (a side remark, not the goal, the demo or the next steps) and tell the
