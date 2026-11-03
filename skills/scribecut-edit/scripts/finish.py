@@ -20,7 +20,6 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 
 SC = os.path.expanduser("~/projects/scribecut/target/release/scribecut")
 args = sys.argv[1:]
@@ -53,6 +52,111 @@ def secs(v):
 def t(x):
     m, s = divmod(round(x, 2), 60)
     return f"{int(m)}:{s:05.2f}"
+
+
+def read_edit(path):
+    """An edit file's tables as nested dicts: `[source]`, `[[cut]]`, `[[slide]]`…
+
+    Hand-written rather than `tomllib`, which arrived in Python 3.11 while macOS
+    still ships 3.9 as `python3`. The edit file only ever holds flat tables of
+    strings, numbers, booleans and arrays of those.
+    """
+    def value(raw):
+        raw = raw.strip()
+        if raw.startswith("["):
+            inner = raw[1:-1].strip()
+            return [value(x) for x in split_commas(inner)] if inner else []
+        if raw[:1] in "\"'":
+            return raw[1:-1]
+        if raw in ("true", "false"):
+            return raw == "true"
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
+
+    doc = {}
+    table = doc
+    lines = iter(open(path).read().splitlines())
+    for line in lines:
+        line = uncommented(line)
+        if not line:
+            continue
+        if line.startswith("[["):
+            name = line[2:line.index("]]")].strip()
+            table = {}
+            doc.setdefault(name, []).append(table)
+        elif line.startswith("["):
+            table = doc
+            for part in line[1:line.index("]")].strip().split("."):
+                table = table.setdefault(part, {})
+        elif "=" in line:
+            key, raw = line.split("=", 1)
+            # An array written over several lines (`kept = [` on a voiceover).
+            while depth(raw) > 0:
+                more = next(lines, None)
+                if more is None:
+                    break
+                raw += " " + uncommented(more)
+            table[key.strip()] = value(raw)
+    return doc
+
+
+def uncommented(line):
+    """`line` without its comment, which a `#` inside a string is not."""
+    out = []
+    for ch, in_string, _ in scan(line):
+        if ch == "#" and not in_string:
+            break
+        out.append(ch)
+    return "".join(out).strip()
+
+
+def split_commas(s):
+    """`s` split on its top-level commas: `[1, 2], [3, 4]` is two parts."""
+    parts, cur = [], ""
+    for ch, in_string, level in scan(s):
+        if ch == "," and not in_string and level == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def depth(s):
+    """How many brackets `s` leaves open; those inside a string don't count."""
+    open_brackets = 0
+    for _, _, level in scan(s):
+        open_brackets = level
+    return open_brackets
+
+
+def scan(s):
+    """Each character of `s`, with whether it is inside a string and how many
+    brackets are open at it."""
+    quote, open_brackets = None, 0
+    for ch in s:
+        if quote:
+            yield ch, True, open_brackets
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+            yield ch, True, open_brackets
+        elif ch in "[{":
+            open_brackets += 1
+            yield ch, False, open_brackets
+        elif ch in "]}":
+            open_brackets -= 1
+            yield ch, False, open_brackets
+        else:
+            yield ch, False, open_brackets
 
 
 failed = []
@@ -99,7 +203,7 @@ check(abs(dur - expect) < 0.5, f"duration {t(dur)} matches --check {t(expect)}")
 if opts["--limit"]:
     check(dur <= secs(opts["--limit"]), f"under the limit {opts['--limit']}")
 
-doc = tomllib.load(open(edit, "rb"))
+doc = read_edit(edit)
 cuts = sorted((secs(c["from"]), secs(c["to"]), c.get("note", "")) for c in doc.get("cut", []))
 
 

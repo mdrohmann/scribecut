@@ -42,7 +42,13 @@ pub enum Source {
     /// A window listed by [`crate::platform`]. Shared on its own through the
     /// portal where [`records_windows_directly`]; otherwise brought to the
     /// front and recorded like an area, pausing while it isn't visible.
-    Window { id: i64, pid: i32, toplevel: Option<String> },
+    Window {
+        id: i64,
+        pid: i32,
+        /// The window's `foreign_toplevel_identifier`, for the portal chooser.
+        #[cfg_attr(target_os = "macos", allow(dead_code))] // no portal there
+        toplevel: Option<String>,
+    },
 }
 
 /// Whether the system itself can offer a single-window picker (the portal on
@@ -120,11 +126,17 @@ pub fn default_project_name() -> String {
     chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }
 
+/// Where recordings are kept: `scribecut` inside the user's videos folder,
+/// which is `~/Videos` on Linux and `~/Movies` on macOS. `None` without even a
+/// home folder.
+pub fn recordings_dir() -> Option<PathBuf> {
+    Some(dirs::video_dir().or_else(dirs::home_dir)?.join("scribecut"))
+}
+
 /// A fresh folder for a new recording, named after the project. An existing
 /// folder of that name is never reused: " 2", " 3"… is appended instead.
 pub fn new_recording_dir(name: &str) -> Result<PathBuf> {
-    let base = dirs::video_dir().or_else(dirs::home_dir).context("no home dir")?;
-    let dir = unused_dir(&base.join("scribecut"), name);
+    let dir = unused_dir(&recordings_dir().context("no home dir")?, name);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

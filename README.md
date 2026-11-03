@@ -234,7 +234,9 @@ show slides/deck.pdf page 3 from there for 20 seconds, with me in the small wind
 A Claude Code skill for the whole job (cut retakes and pauses, add title and closing slides, stay
 under a length limit, export for Slack and check the cuts by re-transcribing the export) is in
 [`skills/scribecut-edit/`](skills/scribecut-edit/SKILL.md). To use it from the recordings folder,
-link it there: `ln -s ~/projects/scribecut/skills/scribecut-edit ~/Videos/scribecut/.claude/skills/`.
+link it there: `ln -s ~/projects/scribecut/skills/scribecut-edit ~/Videos/scribecut/.claude/skills/`
+(`~/Movies/scribecut` on macOS). Its scripts need nothing but `python3`, including the 3.9 that
+macOS ships.
 
 Rendered PDF pages, converted presentations and video poster frames are cached in `.scribecut-cache/`.
 Projects from older versions (`<video>.scribecut.json`) are converted on open (the old file is kept as
