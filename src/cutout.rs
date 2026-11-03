@@ -60,9 +60,58 @@ fn environment() -> Result<ort::environment::Environment> {
     static ENV: std::sync::Mutex<Option<ort::environment::Environment>> = std::sync::Mutex::new(None);
     let mut env = ENV.lock().unwrap();
     if env.is_none() {
-        *env = Some(ort::init().build().context("starting ONNX Runtime")?);
+        *env = Some(start()?.build().context("starting ONNX Runtime")?);
     }
     Ok(env.clone().unwrap())
+}
+
+/// ONNX Runtime, linked into the binary everywhere it can be.
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+fn start() -> Result<ort::environment::EnvironmentBuilder> {
+    Ok(ort::init())
+}
+
+/// On an Intel mac, from the library fetched by [`runtime`].
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn start() -> Result<ort::environment::EnvironmentBuilder> {
+    let lib = runtime()?;
+    ort::init_from(&lib).map_err(|e| anyhow!("loading {}: {e}", lib.display()))
+}
+
+/// ONNX Runtime for an Intel mac, downloaded and unpacked once next to the
+/// models. Nobody builds that library for them any more: `ort` ships none, and
+/// Microsoft's last release with one is the version below.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn runtime() -> Result<PathBuf> {
+    const VERSION: &str = "1.23.2";
+    let dir = dirs::data_dir().context("no data dir")?.join("scribecut/onnxruntime");
+    let lib = dir.join(format!("libonnxruntime.{VERSION}.dylib"));
+    if lib.is_file() {
+        return Ok(lib);
+    }
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("onnxruntime-osx-x86_64-{VERSION}");
+    let file = lib.file_name().unwrap().to_string_lossy().into_owned();
+    let archive = dir.join("onnxruntime.tgz");
+    let url = format!("https://github.com/microsoft/onnxruntime/releases/download/v{VERSION}/{name}.tgz");
+    crate::media::download(&url, &archive, |_| {}).context("downloading ONNX Runtime")?;
+    // Only the library itself, kept at its path inside the archive: the paths
+    // there start with "./", which makes --strip-components a guess.
+    let unpacked = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&dir)
+        .arg(format!("{name}/lib/{file}"))
+        .status()
+        .context("unpacking ONNX Runtime")?;
+    let _ = std::fs::remove_file(&archive);
+    if !unpacked.success() {
+        bail!("could not unpack ONNX Runtime");
+    }
+    std::fs::rename(dir.join(&name).join("lib").join(&file), &lib).context("unpacking ONNX Runtime")?;
+    let _ = std::fs::remove_dir_all(dir.join(&name));
+    Ok(lib)
 }
 
 impl Model {

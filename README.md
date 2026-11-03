@@ -212,7 +212,10 @@ portrait-matting model (MODNet, about 25 MB, downloaded on first use) cuts you o
 picture, only where the camera is on screen. That takes a while on the first export, roughly
 5 seconds per second of camera shown; the result is cached in `.scribecut-cache/` and reused until
 the cuts or camera ranges change. The blur is made from the room alone, so it leaves no
-shadow of you behind your outline.
+shadow of you behind your outline. ONNX Runtime, which runs the model, is built into
+scribecut everywhere but on an Intel mac: nobody publishes that library for them any more, so
+there scribecut downloads Microsoft's last one (1.23.2, about 17 MB) the first time a
+background is used, into `~/Library/Application Support/scribecut/onnxruntime/`.
 
 ## Editing with text files (or an agent)
 

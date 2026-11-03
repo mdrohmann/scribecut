@@ -12,8 +12,6 @@ egui = "0.36.2"
 gst = { package = "gstreamer", version = "0.25.4" }
 gst-app = { package = "gstreamer-app", version = "0.25.2" }
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
-# ONNX Runtime, linked in statically: runs the person-cutout model (see src/cutout.rs).
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,6 +19,16 @@ serde_json = "1.0.151"
 toml = "1.1.8"
 ureq = "3.4.2"
 whisper-rs = "0.16.0"
+
+# ONNX Runtime, linked in statically: runs the person-cutout model (see src/cutout.rs).
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
+
+# Intel macs have no ONNX Runtime to link in: `ort`'s own builds skip them and
+# Microsoft's stopped after 1.23.2, so the library is fetched and loaded at run
+# time instead (see `cutout::runtime`), which is what "load-dynamic" is for.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "tls-native", "api-23"] }
 
 # The ScreenCast portal (PipeWire) is how Linux desktops hand out screen frames.
 [target.'cfg(target_os = "linux")'.dependencies]
