@@ -1,26 +1,44 @@
 //! Cuts the person out of the camera picture, so the export can put a blurred
 //! or chosen background behind them.
 //!
-//! MODNet, a portrait-matting model, turns each camera frame into a matte: how
-//! much of every pixel is the person (white) or the room (black). Mattes are
-//! made once per export layout at a reduced size and frame rate, only for the
-//! stretches where the camera is on screen, and cached next to the recording.
-//! ffmpeg then merges matte, camera and background (see `export`). The
-//! editor's preview runs the model live on smaller frames (`LiveMatte`).
+//! A portrait-matting model turns each camera frame into a matte: how much of
+//! every pixel is the person (white) or the room (black). Which model is the
+//! platform's business — Vision on macOS, MODNet through ONNX Runtime
+//! elsewhere (see the two `Model`s in this module's folder) — and the two draw
+//! slightly different outlines. Mattes are made once per export layout at a
+//! reduced size and frame rate, only for the stretches where the camera is on
+//! screen, and cached next to the recording; the engine's name is part of the
+//! cache key, so a matte is never reused across platforms. ffmpeg then merges
+//! matte, camera and background (see `export`). The editor's preview runs the
+//! model live on smaller frames (`LiveMatte`).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{Context, Result, anyhow, bail};
-use ort::session::Session;
-use ort::value::Tensor;
+use anyhow::{Context, Result, bail};
 
 use crate::project::{Project, Range};
 
-/// MODNet (Apache 2.0), exported to ONNX for transformers.js.
-const MODEL_URL: &str = "https://huggingface.co/Xenova/modnet/resolve/main/onnx/model.onnx";
-const MODEL_FILE: &str = "modnet.onnx";
+#[cfg(target_os = "macos")]
+mod vision;
+#[cfg(target_os = "macos")]
+use vision as engine;
+
+#[cfg(not(target_os = "macos"))]
+mod modnet;
+#[cfg(not(target_os = "macos"))]
+use modnet as engine;
+
+use engine::Model;
+
+/// What a matte is for. The preview has to keep up with playback and is shown
+/// smaller; an export can take its time and is what people look at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quality {
+    Live,
+    Export,
+}
 
 /// Mattes per second: a person moves little between frames, and the model is
 /// the slow part of an export with a background.
@@ -29,123 +47,10 @@ pub const MATTE_FPS: u32 = 15;
 /// of 32 as the model needs.
 const MATTE_WIDTH: u32 = 512;
 
-/// The model's local path, downloading it once if needed.
-fn ensure_model(progress: impl FnMut(f32)) -> Result<PathBuf> {
-    let dir = dirs::data_dir().context("no data dir")?.join("scribecut/models");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(MODEL_FILE);
-    if !path.is_file() {
-        crate::media::download(MODEL_URL, &path, progress)?;
-    }
-    Ok(path)
-}
-
 /// Matte size for a camera of `w`×`h`.
 fn matte_size((w, h): (u32, u32)) -> (u32, u32) {
     let height = (MATTE_WIDTH as f64 * h as f64 / w.max(1) as f64 / 32.0).round() as u32 * 32;
     (MATTE_WIDTH, height.max(32))
-}
-
-/// The model, ready to run on pictures of one size.
-struct Model {
-    session: Session,
-    input: String,
-    w: u32,
-    h: u32,
-    pixels: Vec<f32>,
-}
-
-/// ONNX Runtime allows one environment per process, shared by the preview and the export.
-fn environment() -> Result<ort::environment::Environment> {
-    static ENV: std::sync::Mutex<Option<ort::environment::Environment>> = std::sync::Mutex::new(None);
-    let mut env = ENV.lock().unwrap();
-    if env.is_none() {
-        *env = Some(start()?.build().context("starting ONNX Runtime")?);
-    }
-    Ok(env.clone().unwrap())
-}
-
-/// ONNX Runtime, linked into the binary everywhere it can be.
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-fn start() -> Result<ort::environment::EnvironmentBuilder> {
-    Ok(ort::init())
-}
-
-/// On an Intel mac, from the library fetched by [`runtime`].
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn start() -> Result<ort::environment::EnvironmentBuilder> {
-    let lib = runtime()?;
-    ort::init_from(&lib).map_err(|e| anyhow!("loading {}: {e}", lib.display()))
-}
-
-/// ONNX Runtime for an Intel mac, downloaded and unpacked once next to the
-/// models. Nobody builds that library for them any more: `ort` ships none, and
-/// Microsoft's last release with one is the version below.
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn runtime() -> Result<PathBuf> {
-    const VERSION: &str = "1.23.2";
-    let dir = dirs::data_dir().context("no data dir")?.join("scribecut/onnxruntime");
-    let lib = dir.join(format!("libonnxruntime.{VERSION}.dylib"));
-    if lib.is_file() {
-        return Ok(lib);
-    }
-    std::fs::create_dir_all(&dir)?;
-    let name = format!("onnxruntime-osx-x86_64-{VERSION}");
-    let file = lib.file_name().unwrap().to_string_lossy().into_owned();
-    let archive = dir.join("onnxruntime.tgz");
-    let url = format!("https://github.com/microsoft/onnxruntime/releases/download/v{VERSION}/{name}.tgz");
-    crate::media::download(&url, &archive, |_| {}).context("downloading ONNX Runtime")?;
-    // Only the library itself, kept at its path inside the archive: the paths
-    // there start with "./", which makes --strip-components a guess.
-    let unpacked = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&dir)
-        .arg(format!("{name}/lib/{file}"))
-        .status()
-        .context("unpacking ONNX Runtime")?;
-    let _ = std::fs::remove_file(&archive);
-    if !unpacked.success() {
-        bail!("could not unpack ONNX Runtime");
-    }
-    std::fs::rename(dir.join(&name).join("lib").join(&file), &lib).context("unpacking ONNX Runtime")?;
-    let _ = std::fs::remove_dir_all(dir.join(&name));
-    Ok(lib)
-}
-
-impl Model {
-    /// Loads the model (downloading it once) for `w`×`h` RGB pictures, on up to `threads` cores.
-    fn new(w: u32, h: u32, threads: usize) -> Result<Self> {
-        let path = ensure_model(|_| {})?;
-        // The builder's errors carry the builder, which can't cross threads: keep the message.
-        let session = Session::builder(&environment()?)?
-            .with_intra_threads(threads)
-            .map_err(|e| anyhow!("{e}"))?
-            .commit_from_file(&path)
-            .map_err(|e| anyhow!("loading the cutout model: {e}"))?;
-        let input = session.inputs()[0].name().to_string();
-        Ok(Self { session, input, w, h, pixels: vec![0.0; (w * h * 3) as usize] })
-    }
-
-    /// The matte of one picture (RGB, `w`×`h`): 255 = person, 0 = room.
-    fn run(&mut self, rgb: &[u8], matte: &mut [u8]) -> Result<()> {
-        let plane = (self.w * self.h) as usize;
-        // RGB planes scaled to -1..1, as the model was trained.
-        for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
-            for (c, &v) in px.iter().enumerate() {
-                self.pixels[c * plane + i] = v as f32 / 127.5 - 1.0;
-            }
-        }
-        let shape = [1usize, 3, self.h as usize, self.w as usize];
-        let tensor = Tensor::from_array((shape, self.pixels.clone()))?;
-        let outputs = self.session.run(ort::inputs![self.input.as_str() => tensor])?;
-        let (_, alpha) = outputs[0].try_extract_tensor::<f32>()?;
-        for (g, a) in matte.iter_mut().zip(alpha) {
-            *g = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
-        }
-        Ok(())
-    }
 }
 
 /// The camera's mattes as a grey video on the recording's timeline, at
@@ -163,14 +68,13 @@ pub fn matte(p: &Project, mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     let rounded: Vec<(i64, i64)> =
         shown.iter().map(|r| ((r.start * 10.0).round() as i64, (r.end * 10.0).round() as i64)).collect();
     let out = crate::sources::cache_dir(p)?
-        .join(crate::sources::key(&p.media, (MODEL_FILE, MATTE_FPS, w, h, rounded))?)
+        .join(crate::sources::key(&p.media, (engine::NAME, MATTE_FPS, w, h, rounded))?)
         .with_extension("matte.mkv");
     if out.is_file() {
         return Ok(out);
     }
 
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
-    let mut model = Model::new(w, h, threads)?;
+    let mut model = Model::new(w, h, Quality::Export)?;
     // Only the part of the camera track that is shown is read; the frames
     // before and after it are written black.
     let fps = MATTE_FPS as f64;
@@ -284,9 +188,7 @@ impl LiveMatte {
         let height = (LIVE_WIDTH as f64 * camera.1 as f64 / camera.0.max(1) as f64 / 32.0).round() as u32 * 32;
         let (w, h) = (LIVE_WIDTH, height.max(32));
         std::thread::spawn(move || {
-            // Leave cores for playback.
-            let threads = std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 4);
-            let mut model = match Model::new(w, h, threads) {
+            let mut model = match Model::new(w, h, Quality::Live) {
                 Ok(m) => m,
                 Err(e) => {
                     *worker.error.lock().unwrap() = Some(format!("{e:#}"));
@@ -453,8 +355,8 @@ mod tests {
     #[test]
     #[ignore = "downloads the cutout model"]
     fn two_models_in_one_process() {
-        let mut a = Model::new(64, 64, 1).unwrap();
-        let mut b = Model::new(64, 64, 1).unwrap();
+        let mut a = Model::new(64, 64, Quality::Live).unwrap();
+        let mut b = Model::new(64, 64, Quality::Export).unwrap();
         let (rgb, mut matte) = (vec![128u8; 64 * 64 * 3], vec![0u8; 64 * 64]);
         a.run(&rgb, &mut matte).unwrap();
         b.run(&rgb, &mut matte).unwrap();

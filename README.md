@@ -208,14 +208,15 @@ never interrupts the sound
 
 **Camera background.** `background = "blur"` or `background = "office.jpg"` in the edit file's
 `[camera]` section replaces the room behind you in the export (the "Background" menu or `B` in the editor). A
-portrait-matting model (MODNet, about 25 MB, downloaded on first use) cuts you out of the camera
-picture, only where the camera is on screen. That takes a while on the first export, roughly
-5 seconds per second of camera shown; the result is cached in `.scribecut-cache/` and reused until
-the cuts or camera ranges change. The blur is made from the room alone, so it leaves no
-shadow of you behind your outline. ONNX Runtime, which runs the model, is built into
-scribecut everywhere but on an Intel mac: nobody publishes that library for them any more, so
-there scribecut downloads Microsoft's last one (1.23.2, about 17 MB) the first time a
-background is used, into `~/Library/Application Support/scribecut/onnxruntime/`.
+portrait-matting model cuts you out of the camera picture, only where the camera is on screen.
+That takes a while on the first export, roughly 5 seconds per second of camera shown; the
+result is cached in `.scribecut-cache/` and reused until the cuts or camera ranges change. The
+blur is made from the room alone, so it leaves no shadow of you behind your outline.
+
+The model is the platform's own: Vision's person segmentation on macOS, and MODNet through
+ONNX Runtime elsewhere (about 25 MB, downloaded on first use). The two draw the outline a
+little differently — hair and glasses are where it shows — so the cached matte names the one
+that made it and is never reused across platforms.
 
 ## Editing with text files (or an agent)
 
@@ -278,4 +279,4 @@ when you use `cargo test`, which is separate from the app bundle's own permissio
 | `transcribe` | whisper.cpp with word timestamps |
 | `project` | The edit model (saved by `edit_file` as `.edit.toml`) |
 | `voiceover` | Re-recorded narration: the microphone take and splicing takes into the sound |
-| `cutout` | Cutting the person out of the camera picture (MODNet via ONNX Runtime): mattes for the export, live for the preview |
+| `cutout` | Cutting the person out of the camera picture (Vision on macOS, MODNet via ONNX Runtime elsewhere): mattes for the export, live for the preview |
