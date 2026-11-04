@@ -66,7 +66,13 @@ def read_edit(path):
         if raw.startswith("["):
             inner = raw[1:-1].strip()
             return [value(x) for x in split_commas(inner)] if inner else []
-        if raw[:1] in "\"'":
+        if raw[:1] == '"':
+            # TOML's basic-string escapes (`\"`, `\u2026`…) are JSON's.
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return raw[1:-1]
+        if raw[:1] == "'":
             return raw[1:-1]
         if raw in ("true", "false"):
             return raw == "true"
@@ -141,11 +147,16 @@ def depth(s):
 def scan(s):
     """Each character of `s`, with whether it is inside a string and how many
     brackets are open at it."""
-    quote, open_brackets = None, 0
+    quote, escaped, open_brackets = None, False, 0
     for ch in s:
         if quote:
             yield ch, True, open_brackets
-            quote = None if ch == quote else quote
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote == '"':
+                escaped = True
+            elif ch == quote:
+                quote = None
         elif ch in "\"'":
             quote = ch
             yield ch, True, open_brackets
