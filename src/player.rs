@@ -253,6 +253,35 @@ mod tests {
         assert!(frame.rgba.chunks(4).any(|px| px != first), "frame is blank");
 
         drop(latest);
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The editor plays the edited sound through a second player on an
+    /// audio-only file (`use_sound`), where no frame ever arrives: opening it
+    /// must still succeed, and seeking in it must work.
+    #[test]
+    #[ignore]
+    fn opens_an_audio_only_file() {
+        gst::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("scribecut-sound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sound = dir.join("clean.flac");
+        let ok = crate::media::ffmpeg()
+            .args(["-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .args(["-c:a", "flac"])
+            .arg(&sound)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "could not make a test sound");
+
+        let mut player = Player::new(&sound, (16, 16), egui::Context::default()).unwrap();
+        assert!(player.frame.lock().unwrap().is_none(), "a sound file has no picture");
+        player.seek(1.5);
+        assert!((player.position() - 1.5).abs() < 0.2, "seek went to {}", player.position());
+
+        drop(player);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,8 +12,6 @@ egui = "0.36.2"
 gst = { package = "gstreamer", version = "0.25.4" }
 gst-app = { package = "gstreamer-app", version = "0.25.2" }
 gst-video = { package = "gstreamer-video", version = "0.25.4" }
-# ONNX Runtime, linked in statically: runs the person-cutout model (see src/cutout.rs).
-ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,6 +19,11 @@ serde_json = "1.0.151"
 toml = "1.1.8"
 ureq = "3.4.2"
 whisper-rs = "0.16.0"
+
+# ONNX Runtime, linked in statically: runs MODNet, the person-cutout model
+# (see src/cutout/modnet.rs). macOS has Vision for that instead.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-native", "api-24"] }
 
 # The ScreenCast portal (PipeWire) is how Linux desktops hand out screen frames.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -33,6 +36,16 @@ core-foundation = "0.10.1"
 core-graphics = "0.25.0"
 objc2 = "0.6.3"
 objc2-app-kit = { version = "0.3.1", default-features = false, features = ["std", "NSRunningApplication", "libc"] }
+# Vision cuts the person out of the camera picture (see src/cutout/vision.rs),
+# through CoreVideo pixel buffers.
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn",
+] }
+objc2-foundation = { version = "0.3.1", default-features = false, features = ["std", "NSArray"] }
+objc2-vision = { version = "0.3.2", default-features = false, features = [
+    "std", "objc2-core-video", "VNRequest", "VNStatefulRequest", "VNRequestHandler",
+    "VNGeneratePersonSegmentationRequest", "VNObservation",
+] }
 
 [profile.dev.package."*"]
 opt-level = 3

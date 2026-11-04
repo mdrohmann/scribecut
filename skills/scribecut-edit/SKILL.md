@@ -1,6 +1,6 @@
 ---
 name: scribecut-edit
-description: Edit a scribecut screen recording into a short, shareable video - cut repeated takes and silent pauses, add title/closing slides from a PDF, keep it under a length limit, and export an MP4 that plays in Slack. Use when asked to cut, trim, tighten, shorten or export a recording under ~/Videos/scribecut, to add slides to one, or to remove retakes, "ums" or pauses.
+description: Edit a scribecut screen recording into a short, shareable video - cut repeated takes and silent pauses, add title/closing slides from a PDF, keep it under a length limit, and export an MP4 that plays in Slack. Use when asked to cut, trim, tighten, shorten or export a recording under ~/Videos/scribecut (~/Movies/scribecut on macOS), to add slides to one, or to remove retakes, "ums" or pauses.
 ---
 
 # Editing a scribecut recording
@@ -10,8 +10,9 @@ video with a title slide at the start and a next-steps slide at the end.
 
 ## Inputs
 
-Each recording is a folder `~/Videos/scribecut/<project name>/` (named on scribecut's home
-screen; a timestamp unless the user typed a name, and they may rename it later) with:
+Each recording is a folder `~/Videos/scribecut/<project name>/` (`~/Movies/scribecut/...` on
+macOS), named on scribecut's home screen - a timestamp unless the user typed a name, and they
+may rename it later - with:
 
 - `recording.mkv` - the raw recording (never modify it)
 - `recording.edit.toml` - cuts, slides, camera, overlays. Its header documents the
@@ -19,11 +20,13 @@ screen; a timestamp unless the user typed a name, and they may rename it later) 
 - `recording.transcript.txt` - phrases with `[mm:ss.ss]` times; `recording.transcript.json`
   has every word with `start`/`end` seconds.
 
-"The latest recording" = the newest folder (`ls -td ~/Videos/scribecut/*/ | head -1`).
+"The latest recording" = the newest folder
+(`ls -td ~/{Videos,Movies}/scribecut/*/ 2>/dev/null | head -1`, either platform).
 Confirm which one if the request is ambiguous.
 
 Tool: `SC=~/projects/scribecut/target/release/scribecut`. Don't edit files in
-`~/projects/scribecut` or `~/.local/share/scribecut/models` as part of an editing job -
+`~/projects/scribecut` or the model folder (`~/.local/share/scribecut/models`,
+`~/Library/Application Support/scribecut/models` on macOS) as part of an editing job -
 that is the app's source, and other sessions may be working on it.
 
 Helper scripts are in this skill's `scripts/` folder (`<skill>` below). Run without

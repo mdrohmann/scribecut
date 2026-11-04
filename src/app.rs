@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use egui::{Color32, RichText};
 
-use crate::capture::{Recorder, Source, connect, default_project_name, new_recording_dir};
+use crate::capture::{Recorder, Source, connect, default_project_name, new_recording_dir, recordings_dir};
 use crate::settings::Settings;
 use crate::editor::{Action, Editor, new_project};
 use crate::geom::Output;
@@ -86,7 +86,10 @@ impl App {
             ui.add_space(24.0);
             ui.label("Project name");
             let name = ui.add_sized([240.0, 28.0], egui::TextEdit::singleline(&mut self.project_name));
-            name.on_hover_text("The recording's folder in Videos/scribecut");
+            name.on_hover_text(match recordings_dir() {
+                Some(dir) => format!("The recording's folder in {}", dir.display()),
+                None => "The recording's folder".to_owned(),
+            });
             ui.add_space(12.0);
             let big =
                 |text: &str| egui::Button::new(RichText::new(text).color(Color32::from_rgb(235, 90, 90)).size(18.0));
