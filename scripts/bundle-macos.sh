@@ -38,7 +38,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>          <string>APPL</string>
     <key>CFBundleShortVersionString</key>   <string>0.1.0</string>
     <key>CFBundleVersion</key>              <string>0.1.0</string>
-    <key>LSMinimumSystemVersion</key>       <string>11.0</string>
+    <!-- Vision's person segmentation, for the camera background, needs 12. -->
+    <key>LSMinimumSystemVersion</key>       <string>12.0</string>
     <key>NSHighResolutionCapable</key>      <true/>
     <!-- Shown in the prompt when a recording first opens the microphone. -->
     <key>NSMicrophoneUsageDescription</key>
