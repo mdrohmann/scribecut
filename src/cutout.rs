@@ -68,7 +68,7 @@ pub fn matte(p: &Project, mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     let rounded: Vec<(i64, i64)> =
         shown.iter().map(|r| ((r.start * 10.0).round() as i64, (r.end * 10.0).round() as i64)).collect();
     let out = crate::sources::cache_dir(p)?
-        .join(crate::sources::key(&p.media, (engine::NAME, MATTE_FPS, w, h, rounded))?)
+        .join(crate::sources::key(&p.media, (&*engine::NAME, MATTE_FPS, w, h, rounded))?)
         .with_extension("matte.mkv");
     if out.is_file() {
         return Ok(out);

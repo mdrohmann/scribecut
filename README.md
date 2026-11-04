@@ -213,10 +213,14 @@ That takes a while on the first export, roughly 5 seconds per second of camera s
 result is cached in `.scribecut-cache/` and reused until the cuts or camera ranges change. The
 blur is made from the room alone, so it leaves no shadow of you behind your outline.
 
-The model is the platform's own: Vision's person segmentation on macOS, and MODNet through
-ONNX Runtime elsewhere (about 25 MB, downloaded on first use). The two draw the outline a
-little differently — hair and glasses are where it shows — so the cached matte names the one
-that made it and is never reused across platforms.
+The model is the platform's own: Vision's person segmentation on macOS, and through ONNX Runtime
+elsewhere MODNet for the export (about 25 MB) and MediaPipe's selfie segmentation for the
+editor's preview (under 1 MB), both downloaded on first use. The selfie model keeps up with
+playback but draws a coarser outline, which is why the export doesn't use it. The models draw the
+outline a little differently — hair and glasses are where it shows — so the cached matte names
+the one that made it and is never reused for another. `SCRIBECUT_CUTOUT_MODEL` runs one model for
+both (`modnet`, `modnet-fp16`, `modnet-uint8`, `modnet-quantized`, `modnet-q4`, `selfie`,
+`selfie-landscape`), for comparing them.
 
 ## Editing with text files (or an agent)
 
