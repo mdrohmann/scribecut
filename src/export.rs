@@ -27,6 +27,20 @@ fn fit(w: u32, h: u32) -> String {
     format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1")
 }
 
+/// How far before the first kept second ffmpeg starts reading the recording.
+/// More than the recorder's keyframe interval (2 s), so that decoding has
+/// reached a keyframe before the first frame that is shown.
+const SEEK_MARGIN: f64 = 5.0;
+
+/// Where ffmpeg starts reading the recording (`-ss`), in whole milliseconds as
+/// the recording's timestamps are: shortly before the first kept second.
+/// Decoding and composing everything before it only delays the first frame,
+/// and the progress bar with it, since everything there is cut.
+pub fn seek(p: &Project) -> f64 {
+    let first = p.kept_ranges().first().map_or(0.0, |r| r.start);
+    (((first - SEEK_MARGIN) * 1000.0).floor() / 1000.0).max(0.0)
+}
+
 /// Input indices for the camera with its background replaced: the matte from
 /// `cutout::matte`, and the background picture unless the camera's own
 /// picture is blurred.
@@ -66,8 +80,21 @@ pub fn filter_graph(
 
     // Slides replace the screen recording.
     for (i, (s, &clip)) in p.slides.iter().zip(clips).enumerate() {
-        let shift = if clip { format!(",setpts=PTS-STARTPTS+{:.3}/TB", s.start) } else { String::new() };
-        let _ = write!(g, "[{}:v]{},fps={}{shift}[s{i}];", i + 1, fit(w, h), p.fps);
+        if clip {
+            let _ = write!(g, "[{}:v]{},fps={},setpts=PTS-STARTPTS+{:.3}/TB[s{i}];", i + 1, fit(w, h), p.fps, s.start);
+        } else {
+            // A still is one picture: scaled once, then repeated at the frame
+            // rate for its own range only (plus a frame either side).
+            let repeats = ((s.end - s.start) * p.fps).ceil() as u64 + 1;
+            let _ = write!(
+                g,
+                "[{}:v]{},loop=loop={repeats}:size=1,settb=AVTB,setpts={:.3}/TB+N/({}*TB)[s{i}];",
+                i + 1,
+                fit(w, h),
+                s.start,
+                p.fps
+            );
+        }
         layer(&mut g, &mut base, &format!("[s{i}]"), format!("enable='{}'", enable([(s.start, s.end)])));
     }
 
@@ -83,7 +110,9 @@ pub fn filter_graph(
             let mut camera = "[0:v:1]";
             if let Some(c) = cutout {
                 // The person, made see-through where the matte is dark, over the background.
-                let _ = write!(g, "[0:v:1]split=2[camfg][camroom];[{}:v]scale={cw}:{ch},format=gray", c.matte);
+                // In RGB throughout: left to itself, ffmpeg picks the formats from the
+                // whole graph, so the result would change with an unrelated `-ss`.
+                let _ = write!(g, "[0:v:1]format=gbrp,split=2[camfg][camroom];[{}:v]scale={cw}:{ch},format=gray", c.matte);
                 match c.image {
                     Some(i) => {
                         let _ = write!(
@@ -262,7 +291,8 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
         .map(|(i, s)| sources::export_input(p, s).with_context(|| format!("slide {}", i + 1)))
         .collect::<Result<_>>()?;
     let clips: Vec<bool> = inputs.iter().map(|i| matches!(i, Input::Clip { .. })).collect();
-    let cleanup = crate::audio::cleanup(&p.media);
+    // Measuring the loudness takes a pass over the whole recording: not for a silent clip.
+    let cleanup = if p.has_audio { crate::audio::cleanup(&p.media) } else { None };
     // The matte is made first (minutes, the first time); then the progress
     // bar covers the two halves.
     let mut made_matte = false;
@@ -297,13 +327,19 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
     // -nostdin + null stdin: ffmpeg must not touch the terminal, or a
     // backgrounded scribecut gets stopped by SIGTTOU.
     cmd.stdin(Stdio::null())
-        .args(["-nostdin", "-y", "-v", "error", "-nostats", "-progress", "pipe:1", "-i"])
-        .arg(&p.media);
+        .args(["-nostdin", "-y", "-v", "error", "-nostats", "-progress", "pipe:1"]);
+    // Read from shortly before the first kept second; `-itsoffset` puts the
+    // timestamps back on the recording's timeline, where the graph's times are.
+    let seek = seek(p);
+    if seek > 0.0 {
+        let seek = format!("{seek:.3}");
+        cmd.args(["-ss", &seek, "-itsoffset", &seek]);
+    }
+    cmd.arg("-i").arg(&p.media);
     for (input, slide) in inputs.iter().zip(&p.slides) {
         match input {
-            Input::Still(img) => cmd
-                .args(["-loop", "1", "-framerate", &format!("{}", p.fps), "-t", &format!("{:.3}", p.duration), "-i"])
-                .arg(img),
+            // One picture; the graph repeats it (`loop`).
+            Input::Still(img) => cmd.arg("-i").arg(img),
             Input::Clip { path, start } => cmd
                 .args(["-ss", &format!("{start:.3}"), "-t", &format!("{:.3}", slide.end - slide.start), "-i"])
                 .arg(path),
@@ -419,7 +455,7 @@ mod tests {
         let blur = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
         assert!(
             blur.starts_with(
-                "[0:v:1]split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
+                "[0:v:1]format=gbrp,split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
                  [mroom]negate,format=gbrp,split=2[weight][wblur];\
                  [camroom]format=gbrp[roomrgb];[roomrgb][weight]blend=all_mode=multiply,boxblur=20:2[roomsum];\
                  [wblur]boxblur=20:2[weightsum];[roomsum][weightsum]blend=all_mode=divide[cambg];\
@@ -448,12 +484,22 @@ mod tests {
         let g = filter_graph(&p, &[false, true], &[], None, None, None);
         let fit = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
         assert!(g.starts_with(&format!(
-            "[1:v]{fit},fps=30[s0];[0:v:0][s0]overlay=eof_action=pass:enable='between(t,2.000,4.000)'[b0];\
+            "[1:v]{fit},loop=loop=61:size=1,settb=AVTB,setpts=2.000/TB+N/(30*TB)[s0];[0:v:0][s0]overlay=eof_action=pass:enable='between(t,2.000,4.000)'[b0];\
              [2:v]{fit},fps=30,setpts=PTS-STARTPTS+10.000/TB[s1];[b0][s1]overlay=eof_action=pass:enable='between(t,10.000,12.000)'[b1];\
              [0:v:1]split=2[cf][cp];[cf]{fit}[camfull];[b1][camfull]overlay=eof_action=pass:enable='between(t,13.000,14.000)'[b2];\
              [cp]scale=320:-2,setsar=1[campip];[b2][campip]overlay=eof_action=pass:x=main_w-overlay_w-26:y=main_h-overlay_h-26:enable='between(t,15.000,18.000)'[b3];\
              [b3]null[vov];"
         )), "{g}");
+    }
+
+    #[test]
+    fn reads_from_shortly_before_the_first_kept_second() {
+        let mut p = project();
+        assert_eq!(seek(&p), 0.0);
+        p.add_cut(Range::new(0.0, 3.0));
+        assert_eq!(seek(&p), 0.0, "within the margin of the start");
+        p.add_cut(Range::new(0.0, 12.3456));
+        assert_eq!(seek(&p), 7.345);
     }
 
     /// Renders a real clip with ffmpeg. Run with `cargo test -- --ignored`.
@@ -583,5 +629,32 @@ mod tests {
         expect(1.0, all, [255, 0, 0], false, "no slide at the start");
         expect(9.0, middle, [0, 0, 255], false, "clip only during its range");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Times the re-recording preview of a real project: `SCRIBECUT_TEST_EDIT`
+    /// = an edit file, `SCRIBECUT_TEST_RANGE` = "from-to" in seconds, or unset
+    /// for the whole export. Prints when the first progress arrives and how
+    /// long the whole render takes, and leaves the result next to the edit
+    /// file as `preview-test.mp4`.
+    #[test]
+    #[ignore]
+    fn times_a_real_preview() {
+        let edit = PathBuf::from(std::env::var("SCRIBECUT_TEST_EDIT").expect("SCRIBECUT_TEST_EDIT"));
+        let p = Project::load(&edit).unwrap();
+        let out = edit.with_file_name("preview-test.mp4");
+        let started = std::time::Instant::now();
+        let mut updates = Vec::new();
+        let progress = |f| updates.push((started.elapsed().as_secs_f32(), f));
+        match std::env::var("SCRIBECUT_TEST_RANGE") {
+            Ok(range) => {
+                let (a, b) = range.split_once('-').expect("from-to");
+                preview_clip(&p, Range::new(a.parse().unwrap(), b.parse().unwrap()), 960, &out, progress)
+            }
+            Err(_) => export(&p, &out, progress),
+        }
+        .unwrap();
+        let first = updates.iter().find(|&&(_, f)| f > 0.0);
+        println!("first progress (s, fraction) {first:?}, done after {:?}", started.elapsed());
+        println!("updates {updates:.2?}");
     }
 }
