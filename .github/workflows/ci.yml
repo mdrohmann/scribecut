@@ -77,6 +77,7 @@ jobs:
           # gstreamer's formula is the whole SDK, which carries the playback
           # plugins scribecut needs. ffmpeg does the capturing and exporting.
           brew install --quiet pkg-config cmake gstreamer ffmpeg
+          echo "GSTREAMER_VERSION=$(brew list --versions gstreamer | cut -d' ' -f2)" >> "$GITHUB_ENV"
 
       - name: Install Rust
         run: |
@@ -92,8 +93,11 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          # The gstreamer -sys crates' build scripts record Homebrew's
+          # versioned Cellar paths and do not rerun when Homebrew moves to a new
+          # gstreamer, so a target built against another version fails to link.
+          key: ${{ runner.os }}-cargo-gst${{ env.GSTREAMER_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-gst${{ env.GSTREAMER_VERSION }}-
 
       - name: Build
         run: cargo build --locked --all-targets
