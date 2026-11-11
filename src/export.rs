@@ -112,7 +112,16 @@ pub fn filter_graph(
                 // The person, made see-through where the matte is dark, over the background.
                 // In RGB throughout: left to itself, ffmpeg picks the formats from the
                 // whole graph, so the result would change with an unrelated `-ss`.
-                let _ = write!(g, "[0:v:1]format=gbrp,split=2[camfg][camroom];[{}:v]scale={cw}:{ch},format=gray", c.matte);
+                // At the output's frame rate first: a pause leaves a gap in the camera
+                // track, and ffmpeg would otherwise compose the frame before the gap
+                // once, with that frame's own matte - black where the pause is cut
+                // away, which blurs the person along with the room. Resampled, every
+                // moment is matted with the matte made for it.
+                let _ = write!(
+                    g,
+                    "[0:v:1]fps={},format=gbrp,split=2[camfg][camroom];[{}:v]scale={cw}:{ch},format=gray",
+                    p.fps, c.matte
+                );
                 match c.image {
                     Some(i) => {
                         let _ = write!(
@@ -455,7 +464,7 @@ mod tests {
         let blur = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
         assert!(
             blur.starts_with(
-                "[0:v:1]format=gbrp,split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
+                "[0:v:1]fps=30,format=gbrp,split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
                  [mroom]negate,format=gbrp,split=2[weight][wblur];\
                  [camroom]format=gbrp[roomrgb];[roomrgb][weight]blend=all_mode=multiply,boxblur=20:2[roomsum];\
                  [wblur]boxblur=20:2[weightsum];[roomsum][weightsum]blend=all_mode=divide[cambg];\
