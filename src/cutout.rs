@@ -53,6 +53,14 @@ fn matte_size((w, h): (u32, u32)) -> (u32, u32) {
     (MATTE_WIDTH, height.max(32))
 }
 
+/// Where the camera track is read from for a first shown stretch at `first`:
+/// the start of the recorded piece it is in, rather than the stretch itself. A
+/// pause leaves a gap in the track, and the export shows the frame before the
+/// gap for as long as the gap lasts, so that frame is read and matted too.
+fn read_from(p: &Project, first: f64) -> f64 {
+    p.segment_starts.iter().copied().filter(|&t| t <= first).fold(0.0, f64::max)
+}
+
 /// The camera's mattes as a grey video on the recording's timeline, at
 /// [`MATTE_FPS`]: black where the camera isn't shown. Made on first use and
 /// cached; `progress` gets 0..1 while it is made.
@@ -67,25 +75,31 @@ pub fn matte(p: &Project, mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     let (Some(first), Some(last)) = (shown.first(), shown.last()) else { bail!("the camera is not shown anywhere") };
     let rounded: Vec<(i64, i64)> =
         shown.iter().map(|r| ((r.start * 10.0).round() as i64, (r.end * 10.0).round() as i64)).collect();
+    let fps = MATTE_FPS as f64;
+    let skip = (read_from(p, first.start) * fps).floor() as u64;
+    // Where the reading starts names the matte, as much to retire the ones made
+    // before this: a pause between the old start and the first frame read after
+    // it shifted every matte that followed.
     let out = crate::sources::cache_dir(p)?
-        .join(crate::sources::key(&p.media, (&*engine::NAME, MATTE_FPS, w, h, rounded))?)
+        .join(crate::sources::key(&p.media, (&*engine::NAME, MATTE_FPS, w, h, rounded, skip))?)
         .with_extension("matte.mkv");
     if out.is_file() {
         return Ok(out);
     }
 
     let mut model = Model::new(w, h, Quality::Export)?;
-    // Only the part of the camera track that is shown is read; the frames
-    // before and after it are written black.
-    let fps = MATTE_FPS as f64;
-    let skip = (first.start * fps).floor() as u64;
+    // The camera track is read from `skip` on; the frames before it, and the
+    // ones after the last stretch, are written black.
     let total_frames = (p.duration * fps).ceil() as u64;
     let mut decode = crate::media::ffmpeg()
         .stdin(Stdio::null())
         .args(["-nostdin", "-v", "error", "-ss", &format!("{:.3}", skip as f64 / fps), "-i"])
         .arg(&p.media)
         .args(["-t", &format!("{:.3}", last.end - skip as f64 / fps)])
-        .args(["-map", "0:v:1", "-vf", &format!("fps={MATTE_FPS}:round=near,scale={w}:{h}:flags=bilinear")])
+        // `start_time` pins the first frame to where the reading starts, so
+        // frame k is the camera at (skip + k)/MATTE_FPS even when the track's
+        // own frames begin later or stop and start again.
+        .args(["-map", "0:v:1", "-vf", &format!("fps={MATTE_FPS}:round=near:start_time=0,scale={w}:{h}:flags=bilinear")])
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -360,6 +374,16 @@ mod tests {
         let (rgb, mut matte) = (vec![128u8; 64 * 64 * 3], vec![0u8; 64 * 64]);
         a.run(&rgb, &mut matte).unwrap();
         b.run(&rgb, &mut matte).unwrap();
+    }
+
+    #[test]
+    fn the_camera_is_read_from_the_piece_the_first_stretch_is_in() {
+        let p = Project { segment_starts: vec![30.0, 90.0], ..Project::default() };
+        assert_eq!(read_from(&p, 10.0), 0.0, "nothing recorded before it");
+        assert_eq!(read_from(&p, 95.0), 90.0);
+        // A stretch starting inside a pause: the frame the export shows while
+        // the pause lasts was recorded in the piece before it.
+        assert_eq!(read_from(&p, 89.0), 30.0);
     }
 
     #[test]
