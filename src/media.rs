@@ -143,14 +143,15 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<()> {
 /// On a real recording it took whisper from 128 recognised words to 188, and it
 /// also makes the editor's waveform show the gaps between words more clearly.
 pub fn extract_audio_16k(path: &Path) -> Result<Vec<f32>> {
+    let cleanup = crate::audio::cleanup(path);
     let mut child = ffmpeg();
     child
         .stdin(Stdio::null())
         .args(["-nostdin", "-v", "error", "-i"])
-        .arg(path)
+        .arg(cleanup.as_ref().and_then(|c| c.voice.as_deref()).unwrap_or(path))
         .args(["-vn", "-ac", "1", "-ar", "16000"]);
-    if let Some(cleanup) = crate::audio::cleanup(path) {
-        child.args(["-af", &cleanup]);
+    if let Some(cleanup) = &cleanup {
+        child.args(["-af", &cleanup.chain]);
     }
     let mut child = child
         .args(["-f", "f32le", "-"])

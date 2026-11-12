@@ -134,11 +134,27 @@ with `SCRIBECUT_ENCODER` (e.g. `libx264`) and `SCRIBECUT_BITRATE` (default `12M`
 
 ## Audio
 
-Narration from a built-in microphone comes in quiet, uneven and sitting on
-low-frequency rumble, so the export, the waveform and the transcription all run it
-through a voice cleanup chain first: a high-pass to clear the rumble, `speechnorm`
-to level the speech, gentle downward compression, and loudness normalisation to
-about -16 LUFS with a true-peak ceiling that leaves room for the AAC encoder.
+Narration from a built-in microphone comes in quiet, uneven, sitting on
+low-frequency rumble and, at arm's length, full of the room's reverb. So the export,
+the waveform and the transcription all run it through a voice cleanup chain first:
+a high-pass to clear the rumble, denoising (and dereverberation, with DeepFilterNet),
+a little EQ, the gain that brings the speech to about -16 LUFS, a gentle downward
+expander that quiets the reverb tails between words, a soft compressor, a de-esser,
+and a limiter that leaves room for the AAC encoder. The comment at the top of
+`src/audio.rs` has the details and the measurements behind them.
+
+**DeepFilterNet** (optional, recommended for a built-in microphone) removes reverb as
+well as noise. Install its `deep-filter` tool with
+
+```sh
+cargo install --git https://github.com/Rikorose/DeepFilterNet --tag v0.5.6 deep_filter \
+    --features tract,bin,default-model,wav-utils
+```
+
+It is found on `PATH` or in `~/.cargo/bin`. It is not an ffmpeg filter, so each
+recording and re-recorded take goes through it once (a few seconds per minute of
+sound), and the result is kept in `.scribecut-cache/` next to it. Without it,
+RNNoise does the denoising, and only the expander works on the reverb.
 
 On macOS the microphone is **not** captured by ffmpeg. Its AVFoundation audio input
 drops 8 to 22 per cent of its samples even with nothing else running — measured at 4
@@ -159,24 +175,26 @@ original is always there to fall back on.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `SCRIBECUT_AUDIO` | `voice` | `off` for the raw recording, `voice` for the chain above, `strong` to add denoising and de-essing for a noisy room |
+| `SCRIBECUT_AUDIO` | `voice` | `off` for the raw recording, `voice` for the chain above, `strong` to add a second, stationary-hiss denoiser for a very noisy microphone |
 | `SCRIBECUT_LOUDNESS` | `-16` | Target programme loudness in LUFS |
+| `SCRIBECUT_DEEP_FILTER` | found on `PATH` | Path to the `deep-filter` tool, or `off` to use RNNoise |
 
-**You should not need to tune this per microphone.** The two leveling stages are
-adaptive: `loudnorm` measures the actual programme and `speechnorm` works relative
-to peaks. Measured over one speech recording fed in at levels from -6 to -40 LUFS,
-and separately with added hiss, a 12 dB bass lift and a 10 dB treble lift, every
-variant came out between -14.4 and -14.7 LUFS with the true peak on target. The one
-judgement call left is how noisy your room is, which is what `strong` is for.
+**You should not need to tune this per microphone.** The gain is measured first and
+applied before the expander and compressor, so they always work on speech at the
+target loudness: the same recording fed in 20 dB quieter comes out at the same
+loudness, with the same amount of reverb taken out. A close microphone (a headset or
+a USB dynamic) goes through the same chain; it has less room in it to begin with, so
+the reverb stages simply find less to do. The one judgement call left is how noisy
+your room is, which is what `strong` is for.
 
 It helps far more to record at a sensible level in the first place. On a real
 recording measured here the microphone was about 19 dB below the usual speech
 target, and gain applied afterwards cannot add detail that was never captured —
 raise the input level in the system's sound settings and the chain has less to do.
 
-Everything here is plain ffmpeg filtering, so it behaves the same on Linux and
-macOS. `speechnorm` and `deesser` need ffmpeg 4.3 or newer; an older build quietly
-drops those stages instead of failing the export.
+Apart from DeepFilterNet, everything here is plain ffmpeg filtering, so it behaves
+the same on Linux and macOS. `deesser` needs ffmpeg 4.3 or newer; an older build
+quietly drops that stage instead of failing the export.
 
 ## Editing
 
@@ -265,6 +283,8 @@ The `--ignored` set does real work: an ffmpeg export, a playbin decode, a whispe
 transcription (downloads the model and a sample), and two screen recordings. The recording
 ones need Screen Recording permission for whatever runs them — granted to your terminal
 when you use `cargo test`, which is separate from the app bundle's own permission.
+`audio::tests::deep_filter_keeps_the_timeline` needs DeepFilterNet's `deep-filter`
+installed (see [Audio](#audio)); the other audio tests run with or without it.
 
 ## Layout
 

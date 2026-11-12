@@ -52,7 +52,8 @@ pub struct CutoutInputs {
 
 /// Builds the `-filter_complex` graph. Input 0 is the recording (camera = its
 /// 2nd video stream); input `i + 1` is slide `i`, a video clip if `clips[i]`;
-/// after the slides come the voiceover takes, in order.
+/// after the slides come the voiceover takes, in order. The recording's sound
+/// is read from input `sound` (0, or the cleaned-up voice as an extra input).
 /// `text_files[i]` holds overlay i's text. `cutout` replaces the room behind
 /// the person on camera.
 /// `audio_cleanup` is an ffmpeg filter chain applied to the finished
@@ -66,6 +67,7 @@ pub fn filter_graph(
     font: Option<&Path>,
     audio_cleanup: Option<&str>,
     cutout: Option<CutoutInputs>,
+    sound: usize,
 ) -> String {
     let mut g = String::new();
     let (w, h) = (p.width, p.height);
@@ -183,12 +185,13 @@ pub fn filter_graph(
     if p.has_audio {
         // Re-recorded narration goes in on the source timeline, so that it is
         // cut along with everything else.
-        let audio = match crate::voiceover::splice(p, "[0:a]", 1 + p.slides.len(), "[spliced]") {
+        let recording = format!("[{sound}:a]");
+        let audio = match crate::voiceover::splice(p, &recording, 1 + p.slides.len(), "[spliced]") {
             Some(splice) => {
                 let _ = write!(g, "{splice};");
-                "[spliced]"
+                "[spliced]".to_string()
             }
-            None => "[0:a]",
+            None => recording,
         };
         let _ = write!(g, "{audio}asplit={n}{};", (0..n).map(|i| format!("[as{i}]")).collect::<String>());
     }
@@ -314,7 +317,14 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
     let cutout = matte
         .as_ref()
         .map(|_| CutoutInputs { matte: first_extra, image: background_image.as_ref().map(|_| first_extra + 1) });
-    let mut graph = filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_deref(), cutout);
+    // DeepFilterNet's voice, if used, comes in last.
+    let voice = cleanup.as_ref().and_then(|c| c.voice.as_ref());
+    let sound = match voice {
+        Some(_) => first_extra + usize::from(matte.is_some()) + usize::from(background_image.is_some()),
+        None => 0,
+    };
+    let mut graph =
+        filter_graph(p, &clips, &text_files, font.as_deref(), cleanup.as_ref().map(|c| c.chain.as_str()), cutout, sound);
     let video_out = match small {
         Some(width) => {
             let _ = write!(graph, ";[outv]scale='min({width},iw)':-2[small]");
@@ -330,12 +340,9 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
         .args(["-nostdin", "-y", "-v", "error", "-nostats", "-progress", "pipe:1"]);
     // Read from shortly before the first kept second; `-itsoffset` puts the
     // timestamps back on the recording's timeline, where the graph's times are.
-    let seek = seek(p);
-    if seek > 0.0 {
-        let seek = format!("{seek:.3}");
-        cmd.args(["-ss", &seek, "-itsoffset", &seek]);
-    }
-    cmd.arg("-i").arg(&p.media);
+    let seek = format!("{:.3}", seek(p));
+    let seek_args: &[&str] = if seek != "0.000" { &["-ss", &seek, "-itsoffset", &seek] } else { &[] };
+    cmd.args(seek_args).arg("-i").arg(&p.media);
     for (input, slide) in inputs.iter().zip(&p.slides) {
         match input {
             // One picture; the graph repeats it (`loop`).
@@ -347,7 +354,7 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
     }
     if p.has_audio {
         for v in &p.voiceovers {
-            cmd.arg("-i").arg(p.resolve(&v.file));
+            cmd.arg("-i").arg(crate::audio::sound(cleanup.as_ref(), &p.resolve(&v.file)));
         }
     }
     if let Some(matte) = &matte {
@@ -356,6 +363,9 @@ fn render(p: &Project, out: &Path, small: Option<u32>, mut progress: impl FnMut(
     if let Some(image) = &background_image {
         cmd.args(["-loop", "1", "-framerate", &format!("{}", p.fps), "-t", &format!("{:.3}", p.duration), "-i"])
             .arg(image);
+    }
+    if let Some(voice) = voice {
+        cmd.args(seek_args).arg("-i").arg(voice);
     }
     cmd.args(["-filter_complex", &graph, "-map", video_out]);
     if p.has_audio {
@@ -403,7 +413,7 @@ mod tests {
 
     #[test]
     fn graph_without_edits_is_single_piece() {
-        let g = filter_graph(&project(), &[], &[], None, None, None);
+        let g = filter_graph(&project(), &[], &[], None, None, None, 0);
         assert_eq!(
             g,
             "[0:v:0]null[vov];[vov]split=1[vs0];[0:a]asplit=1[as0];\
@@ -419,7 +429,7 @@ mod tests {
         p.has_audio = false;
         p.add_cut(Range::new(5.0, 8.0));
         p.overlays.push(Overlay { start: 1.0, end: 3.5, text: "hi".into(), x: 0.25, y: 0.75, size: 0.1, color: [255, 0, 16] });
-        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None, None);
+        let g = filter_graph(&p, &[], &[PathBuf::from("/t/o0.txt")], Some(Path::new("/f/a b.ttf")), None, None, 0);
         assert!(g.starts_with("[0:v:0]drawtext=fontfile='/f/a b.ttf':textfile='/t/o0.txt':"));
         assert!(g.contains("fontsize=72:fontcolor=0xff0010:"));
         assert!(g.contains("x=w*0.25000-text_w/2:y=h*0.75000-text_h/2:enable='between(t,1.000,3.500)'[vov]"));
@@ -452,7 +462,7 @@ mod tests {
         let mut p = project();
         p.camera_size = Some((640, 480));
         p.set_camera(Range::new(2.0, 5.0), CameraMode::Full);
-        let blur = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
+        let blur = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }), 0);
         assert!(
             blur.starts_with(
                 "[0:v:1]format=gbrp,split=2[camfg][camroom];[1:v]scale=640:480,format=gray,split=2[matte][mroom];\
@@ -463,13 +473,13 @@ mod tests {
             ),
             "{blur}"
         );
-        let image = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: Some(2) }));
+        let image = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: Some(2) }), 0);
         assert!(image.contains(
             "[matte];[camroom]nullsink;[2:v]scale=640:480:force_original_aspect_ratio=increase,crop=640:480,setsar=1[cambg];"
         ));
         // Without the camera on screen there is nothing to cut out.
         p.camera_ranges.clear();
-        let none = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }));
+        let none = filter_graph(&p, &[], &[], None, None, Some(CutoutInputs { matte: 1, image: None }), 0);
         assert!(!none.contains("matte"), "{none}");
     }
 
@@ -481,7 +491,7 @@ mod tests {
         p.camera_size = Some((640, 480));
         p.set_camera(Range::new(13.0, 14.0), CameraMode::Full);
         p.set_camera(Range::new(15.0, 18.0), CameraMode::Pip);
-        let g = filter_graph(&p, &[false, true], &[], None, None, None);
+        let g = filter_graph(&p, &[false, true], &[], None, None, None, 0);
         let fit = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
         assert!(g.starts_with(&format!(
             "[1:v]{fit},loop=loop=61:size=1,settb=AVTB,setpts=2.000/TB+N/(30*TB)[s0];[0:v:0][s0]overlay=eof_action=pass:enable='between(t,2.000,4.000)'[b0];\
